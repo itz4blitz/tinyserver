@@ -453,8 +453,12 @@ async fn only_the_seat_holder_speaks_mls_and_only_as_itself() {
         let mut a = dial(ws, &cast.owner.0, &cast.lobby, true).await.expect("a");
         settle(&mut [&mut a], |apps| apps[0].starts == 1).await;
 
-        // Another socket of the same person does not hold the seat; nor does anyone outside.
-        let mut other = socket(&cast, &cast.owner).await;
+        // Their other device does not hold the seat; nor does anyone outside.
+        let other_device = db::open_session(&db.runtime, &cast.owner.0)
+            .await
+            .expect("a second session")
+            .token;
+        let mut other = connect(&cast.server, &other_device, None).await.0;
         let kp = json!({"type": "call.e2ee", "ref": "k", "op": "key_package", "data": "AAAA"});
         let reply = answer(&mut other, kp.clone()).await;
         assert_eq!(

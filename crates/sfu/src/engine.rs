@@ -35,7 +35,7 @@ use crate::limit::Bucket;
 use crate::room::{Announced, Slots, Speech};
 use crate::sdp;
 use crate::tcp::{Conn, Readout};
-use crate::video::{self, Ceiling, Fit, Floor, Layer, Link, Quality, Rebase};
+use crate::video::{self, Ceiling, Fit, Floor, Layer, Link, Quality, Rebase, ShareGate};
 use crate::{Answer, Command, Config, Event, Lost, Refused, Reply, Slot, VideoKind, VideoSlot};
 
 const SOCKET: Token = Token(0);
@@ -162,6 +162,7 @@ struct Screen {
     probing: Option<u64>,
     /// What this listener's link has room for.
     link: Link,
+    share_gate: ShareGate,
 }
 
 struct Peer {
@@ -1195,8 +1196,14 @@ impl Engine {
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return false,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                // An ICMP error from an earlier send. Not this read's problem.
-                Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
+                // An ICMP error from an earlier send, which Windows reports as a reset. Not this
+                // read's problem, and stopping here would lose the socket's readiness.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+                    ) =>
+                {
                     tracing::debug!(reason = "icmp", "media dropped");
                 }
                 Err(error) => {
@@ -1699,7 +1706,19 @@ impl Engine {
         let Some(screen) = peer.screen.as_mut() else {
             return;
         };
-        let fit = screen.link.update(spare, hold, now);
+        // With no video going out the estimator has nothing to measure, and sinks to about what
+        // it was last told to probe for. That says nothing about the link, unless this listener
+        // was held back: then str0m pads the stream to find out, and the estimate is the way back.
+        let measured =
+            screen.showing.is_some() || screen.link.paused() || screen.share_gate.refused();
+        let fit = screen.link.update(spare.filter(|_| measured), hold, now);
+        let showing_share = screen
+            .showing
+            .is_some_and(|(_, layer)| layer == Layer::Share);
+        let room_for_share = fit.is_none_or(|fit| fit >= Fit::Share);
+        let share_fits = screen
+            .share_gate
+            .allows(showing_share, room_for_share, hold, now);
         let Some(peer) = self.peers.get(&id) else {
             return;
         };
@@ -1717,7 +1736,6 @@ impl Engine {
             .and_then(|room| room.sharer)
             .map(|sharer| (sharer, Layer::Share))
             .filter(sends);
-        let share_fits = fit.is_none_or(|fit| fit >= Fit::Share);
         let ceiling_camera = ceiling.camera;
         let publisher = room
             .filter(|_| share.is_none() || !share_fits)
@@ -1766,6 +1784,9 @@ impl Engine {
         let Some(screen) = peer.screen.as_mut() else {
             return;
         };
+        if share.is_none() {
+            screen.share_gate = ShareGate::default();
+        }
         let changed = screen.showing != showing;
         screen.wanted = wanted;
         screen.showing = showing;
@@ -1863,6 +1884,7 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                                 rebase: Rebase::default(),
                                 probing: None,
                                 link: Link::default(),
+                                share_gate: ShareGate::default(),
                             });
                         }
                         Direction::RecvOnly | Direction::SendRecv | Direction::Inactive

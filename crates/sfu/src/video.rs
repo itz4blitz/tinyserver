@@ -158,6 +158,44 @@ impl Link {
     }
 }
 
+impl Link {
+    /// The link has no room for video at all.
+    pub fn paused(&self) -> bool {
+        self.fit == Some(Fit::Audio)
+    }
+}
+
+/// Whether a listener gets the room's share. A link that has carried no video says little about
+/// what it could carry, so a share is always tried, and the estimate gets `hold` to catch up
+/// with it. If there is still no room the share gives way until there is.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShareGate {
+    showing_since: Option<Instant>,
+    refused: bool,
+}
+
+impl ShareGate {
+    /// `showing`: the slot carries the share now. `fits`: the link has room for one.
+    pub fn allows(&mut self, showing: bool, fits: bool, hold: Duration, now: Instant) -> bool {
+        if fits {
+            self.refused = false;
+        }
+        if showing {
+            let since = *self.showing_since.get_or_insert(now);
+            if !fits && now.saturating_duration_since(since) >= hold {
+                self.refused = true;
+            }
+        } else {
+            self.showing_since = None;
+        }
+        !self.refused
+    }
+
+    pub fn refused(&self) -> bool {
+        self.refused
+    }
+}
+
 /// The layer a listener should get. `fit` is what its link has room for; with no estimate yet
 /// it starts on `l`.
 pub(crate) fn pick_layer(fit: Option<Fit>, quality: Quality, ceiling: Quality) -> Option<Layer> {
@@ -392,6 +430,21 @@ mod tests {
         // A little audio off the estimator's 1,000 kb/s start must not lose a share.
         let first = link.update(Some(950), HOLD, Instant::now());
         assert_eq!(first, Some(Fit::Share));
+    }
+
+    #[test]
+    fn a_share_gets_a_fair_try_then_gives_way_until_the_link_has_room() {
+        let start = Instant::now();
+        let mut gate = ShareGate::default();
+        assert!(gate.allows(false, false, HOLD, start), "never tried");
+        assert!(gate.allows(true, false, HOLD, start));
+        let almost = start + HOLD - Duration::from_millis(1);
+        assert!(gate.allows(true, false, almost - start, start));
+        assert!(!gate.allows(true, false, HOLD, start + HOLD));
+        assert!(gate.refused());
+        assert!(!gate.allows(false, false, HOLD, start + HOLD));
+        assert!(gate.allows(false, true, HOLD, start + HOLD * 2));
+        assert!(!gate.refused());
     }
 
     #[test]
