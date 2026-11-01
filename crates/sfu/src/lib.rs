@@ -68,7 +68,8 @@ mod rtc_reason_tests {
 
 /// Commands waiting for the media thread. A full queue refuses the next one.
 const COMMANDS: usize = 1024;
-/// Events waiting for the API. A full queue drops `Speaking` and `Load`.
+/// Events waiting for the API. A full queue drops `Speaking` and `Load`, and the media thread
+/// keeps the rest until there is room.
 const EVENTS: usize = 1024;
 
 /// Where the media thread listens, what it advertises, and its limits.

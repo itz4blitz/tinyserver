@@ -28,6 +28,7 @@ use str0m::media::{Mid, Rid};
 use str0m::net::{DatagramRecv, Protocol, Receive, TcpType};
 use str0m::{Candidate, Event as RtcEvent, Input, Output, Rtc, RtcConfig};
 use tokio::sync::mpsc as async_mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::limit::Bucket;
 use crate::room::{Announced, Slots, Speech};
@@ -289,11 +290,56 @@ impl Tcp {
     }
 }
 
+/// Events on their way to the API. The media thread must not wait for it, so what the queue
+/// cannot take now stays here in order, and `tick` tries again. These come from joins, leaves,
+/// and slot changes, which the API already limits, so they stay few if it stalls.
+struct Outbox {
+    sender: async_mpsc::Sender<Event>,
+    waiting: VecDeque<Event>,
+}
+
+impl Outbox {
+    fn new(sender: async_mpsc::Sender<Event>) -> Self {
+        Self {
+            sender,
+            waiting: VecDeque::new(),
+        }
+    }
+
+    /// An event the API must see.
+    fn tell(&mut self, event: Event) {
+        self.waiting.push_back(event);
+        self.flush();
+    }
+
+    /// An event that may be dropped when the queue is full.
+    fn hint(&self, event: Event) {
+        let _ = self.sender.try_send(event);
+    }
+
+    /// Hands the API what it has room for.
+    fn flush(&mut self) {
+        while let Some(event) = self.waiting.pop_front() {
+            match self.sender.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => {
+                    self.waiting.push_front(event);
+                    return;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    self.waiting.clear();
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Where a drained `Rtc` puts what it produced.
 struct Sink<'a> {
     socket: &'a UdpSocket,
     tcp: &'a mut Tcp,
-    events: &'a async_mpsc::Sender<Event>,
+    events: &'a mut Outbox,
     egress: &'a mut u64,
     forward: &'a mut VecDeque<(PeerId, MediaData)>,
     /// Listeners who asked for a keyframe on their video slot.
@@ -311,7 +357,7 @@ pub(crate) struct Engine {
     public: SocketAddr,
     lan: Option<SocketAddr>,
     inbox: Receiver<Command>,
-    events: async_mpsc::Sender<Event>,
+    events: Outbox,
     alive: Arc<AtomicBool>,
     crypto: Arc<CryptoProvider>,
     cert: DtlsCert,
@@ -386,7 +432,7 @@ impl Engine {
             listener,
             tcp,
             inbox,
-            events,
+            events: Outbox::new(events),
             alive,
             crypto,
             cert,
@@ -938,13 +984,10 @@ impl Engine {
         self.replan = true;
         if let Some(lost) = lost {
             tracing::info!(call_id = %peer.call_id, ?lost, "media lost");
-            tell(
-                &self.events,
-                Event::Left {
-                    call_id: peer.call_id.clone(),
-                    lost,
-                },
-            );
+            self.events.tell(Event::Left {
+                call_id: peer.call_id.clone(),
+                lost,
+            });
         }
         let members = match self.rooms.get_mut(&peer.room_id) {
             Some(room) => {
@@ -1029,14 +1072,11 @@ impl Engine {
             peer.told.clone_from(&audio);
             peer.told_video.clone_from(&video);
         }
-        tell(
-            &self.events,
-            Event::Slots {
-                call_id,
-                audio,
-                video,
-            },
-        );
+        self.events.tell(Event::Slots {
+            call_id,
+            audio,
+            video,
+        });
     }
 
     fn peer_mut(&mut self, call_id: &str) -> Option<&mut Peer> {
@@ -1160,6 +1200,7 @@ impl Engine {
 
     /// Timeouts, deadlines, speaking, load, and the dead.
     fn tick(&mut self, now: Instant) {
+        self.events.flush();
         let due: Vec<PeerId> = self
             .peers
             .iter()
@@ -1216,13 +1257,10 @@ impl Engine {
             let egress_kbps = self.egress.saturating_mul(8) / since.as_millis().max(1) as u64;
             self.egress = 0;
             self.load_at = now;
-            hint(
-                &self.events,
-                Event::Load {
-                    egress_kbps,
-                    participants: self.peers.len(),
-                },
-            );
+            self.events.hint(Event::Load {
+                egress_kbps,
+                participants: self.peers.len(),
+            });
         }
     }
 
@@ -1266,13 +1304,10 @@ impl Engine {
                 .map(|peer| peer.user_id.clone())
                 .collect();
             if let Some(user_ids) = room.announced.due(user_ids, now) {
-                hint(
-                    &self.events,
-                    Event::Speaking {
-                        room_id: room_id.clone(),
-                        user_ids,
-                    },
-                );
+                self.events.hint(Event::Speaking {
+                    room_id: room_id.clone(),
+                    user_ids,
+                });
             }
         }
     }
@@ -1285,7 +1320,7 @@ impl Engine {
         let mut sink = Sink {
             socket: &self.socket,
             tcp: &mut self.tcp,
-            events: &self.events,
+            events: &mut self.events,
             egress: &mut self.egress,
             forward: &mut self.forward,
             asks: &mut self.asks,
@@ -1349,7 +1384,7 @@ impl Engine {
                 let mut sink = Sink {
                     socket: &self.socket,
                     tcp: &mut self.tcp,
-                    events: &self.events,
+                    events: &mut self.events,
                     egress: &mut self.egress,
                     forward: &mut self.forward,
                     asks: &mut self.asks,
@@ -1436,7 +1471,7 @@ impl Engine {
             let mut sink = Sink {
                 socket: &self.socket,
                 tcp: &mut self.tcp,
-                events: &self.events,
+                events: &mut self.events,
                 egress: &mut self.egress,
                 forward: &mut self.forward,
                 asks: &mut self.asks,
@@ -1650,12 +1685,9 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                 RtcEvent::Connected => {
                     peer.connected = true;
                     tracing::info!(call_id = %peer.call_id, "media connected");
-                    tell(
-                        sink.events,
-                        Event::Connected {
-                            call_id: peer.call_id.clone(),
-                        },
-                    );
+                    sink.events.tell(Event::Connected {
+                        call_id: peer.call_id.clone(),
+                    });
                 }
                 RtcEvent::MediaAdded(added) if added.kind == MediaKind::Audio => {
                     match added.direction {
@@ -1828,16 +1860,6 @@ fn readiness(event: &Ready) -> (Token, bool, bool) {
     )
 }
 
-/// Events the API must see. The API drains its queue, so this waits rarely and briefly.
-fn tell(events: &async_mpsc::Sender<Event>, event: Event) {
-    let _ = events.blocking_send(event);
-}
-
-/// Events that may be dropped when the queue is full.
-fn hint(events: &async_mpsc::Sender<Event>, event: Event) {
-    let _ = events.try_send(event);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1877,6 +1899,42 @@ mod tests {
             dropped += u32::from(!budget.take(SEALED_FRAME * 4, at));
         }
         assert!(dropped > 500, "only {dropped} of 1500 dropped");
+    }
+
+    fn left(call_id: &str) -> Event {
+        Event::Left {
+            call_id: call_id.to_string(),
+            lost: Lost::Gone,
+        }
+    }
+
+    #[test]
+    fn events_over_a_full_queue_wait_their_turn_and_nothing_blocks() {
+        let (sender, mut receiver) = async_mpsc::channel(1);
+        let mut outbox = Outbox::new(sender);
+        // `blocking_send` would stop the media thread here until the API read.
+        for call_id in ["a", "b", "c"] {
+            outbox.tell(left(call_id));
+        }
+        outbox.hint(left("dropped"));
+        assert_eq!(receiver.try_recv().ok(), Some(left("a")));
+        outbox.flush();
+        assert_eq!(receiver.try_recv().ok(), Some(left("b")));
+        outbox.tell(left("d"));
+        assert_eq!(receiver.try_recv().ok(), Some(left("c")));
+        outbox.flush();
+        assert_eq!(receiver.try_recv().ok(), Some(left("d")));
+        assert!(receiver.try_recv().is_err());
+        assert!(outbox.waiting.is_empty());
+    }
+
+    #[test]
+    fn events_for_a_gone_api_are_let_go() {
+        let (sender, receiver) = async_mpsc::channel(1);
+        let mut outbox = Outbox::new(sender);
+        drop(receiver);
+        outbox.tell(left("a"));
+        assert!(outbox.waiting.is_empty());
     }
 
     #[test]
