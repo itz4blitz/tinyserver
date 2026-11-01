@@ -41,6 +41,8 @@ const WAKE: Token = Token(1);
 const LISTENER: Token = Token(2);
 /// TCP streams take tokens from here up.
 const FIRST_STREAM: usize = 3;
+/// Datagrams read from the socket per turn, so TCP streams, commands and timeouts get a say.
+const READ_BATCH: usize = 64;
 /// Bytes read from one TCP stream per turn of the loop, so one cannot starve the rest.
 const STREAM_READ: usize = 64 * 1024;
 /// Port 0 picks a UDP port, and TCP may already hold that number, or on Windows have reserved
@@ -302,6 +304,8 @@ pub(crate) struct Engine {
     config: Config,
     poll: Poll,
     socket: UdpSocket,
+    /// The last read stopped at `READ_BATCH` with datagrams perhaps still waiting.
+    socket_unread: bool,
     listener: TcpListener,
     tcp: Tcp,
     public: SocketAddr,
@@ -378,6 +382,7 @@ impl Engine {
             config,
             poll,
             socket,
+            socket_unread: false,
             listener,
             tcp,
             inbox,
@@ -414,7 +419,7 @@ impl Engine {
         let mut events = Events::with_capacity(256);
         let mut buf = vec![0; DATAGRAM];
         loop {
-            let wait = if self.tcp.unread.is_empty() {
+            let wait = if self.tcp.unread.is_empty() && !self.socket_unread {
                 self.deadline()
                     .saturating_duration_since(Instant::now())
                     .min(TICK)
@@ -433,9 +438,10 @@ impl Engine {
             }
             let ready: Vec<(Token, bool, bool)> = events.iter().map(readiness).collect();
             let mut unread = std::mem::take(&mut self.tcp.unread);
+            let mut socket_ready = std::mem::take(&mut self.socket_unread);
             for (token, readable, writable) in ready {
                 match token {
-                    SOCKET => self.read(&mut buf),
+                    SOCKET => socket_ready = true,
                     WAKE => {}
                     LISTENER => self.accept(Instant::now(), &mut unread),
                     token => {
@@ -447,6 +453,9 @@ impl Engine {
                         }
                     }
                 }
+            }
+            if socket_ready {
+                self.socket_unread = self.read(&mut buf);
             }
             for token in unread {
                 self.read_stream(token, Instant::now());
@@ -1047,9 +1056,11 @@ impl Engine {
         }
     }
 
-    /// Reads every datagram waiting on the socket.
-    fn read(&mut self, buf: &mut [u8]) {
-        loop {
+    /// Reads the datagrams waiting on the socket, up to `READ_BATCH`. True if it stopped there
+    /// with more perhaps waiting: readiness is edge-triggered, so only reading to `WouldBlock`
+    /// earns another event, and `run` must come back without one.
+    fn read(&mut self, buf: &mut [u8]) -> bool {
+        for _ in 0..READ_BATCH {
             match self.socket.recv_from(buf) {
                 Ok((n, source)) => {
                     let now = Instant::now();
@@ -1057,7 +1068,7 @@ impl Engine {
                         self.receive(packet, Protocol::Udp, source, now);
                     }
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return false,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 // An ICMP error from an earlier send. Not this read's problem.
                 Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
@@ -1065,10 +1076,11 @@ impl Engine {
                 }
                 Err(error) => {
                     tracing::warn!(%error, "media read failed");
-                    return;
+                    return false;
                 }
             }
         }
+        true
     }
 
     /// One datagram, or one frame from a TCP stream. Over its source's budget, or for
@@ -1342,7 +1354,7 @@ impl Engine {
                     forward: &mut self.forward,
                     asks: &mut self.asks,
                 };
-                drain(listener, peer, &mut sink);
+                release(listener, peer, &mut sink, now);
             }
         }
         for asker in std::mem::take(&mut self.asks) {
@@ -1429,7 +1441,7 @@ impl Engine {
                 forward: &mut self.forward,
                 asks: &mut self.asks,
             };
-            drain(listener, peer, &mut sink);
+            release(listener, peer, &mut sink, now);
             if switched {
                 self.tell_slots(listener);
             }
@@ -1591,6 +1603,16 @@ impl Engine {
     }
 }
 
+/// Sends what a `write` queued. str0m turns a write into packets only on a timeout, so a
+/// drain alone sends nothing, and the frame would wait for `tick` behind every other read.
+fn release(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>, now: Instant) {
+    if let Err(error) = peer.rtc.handle_input(Input::Timeout(now)) {
+        tracing::warn!(call_id = %peer.call_id, direction = "input", reason = crate::rtc_reason(&error), "media failed");
+        peer.rtc.disconnect();
+    }
+    drain(id, peer, sink);
+}
+
 fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
     loop {
         if !peer.rtc.is_alive() {
@@ -1714,7 +1736,10 @@ fn bind(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, u16)> {
             }
             Err(error)
                 if addr.port() == 0
-                    && matches!(error.kind(), ErrorKind::AddrInUse | ErrorKind::PermissionDenied)
+                    && matches!(
+                        error.kind(),
+                        ErrorKind::AddrInUse | ErrorKind::PermissionDenied
+                    )
                     && tries < BIND_TRIES => {}
             Err(error) => return Err(error),
         }
@@ -1862,5 +1887,98 @@ mod tests {
             config.reordering_timeout_audio(),
             Some(Duration::from_millis(40))
         );
+    }
+}
+
+/// The media thread's steps driven by hand, to see what each one does on its own.
+#[cfg(all(test, feature = "headless"))]
+mod turn_tests {
+    use std::net::{Ipv4Addr, UdpSocket as StdUdpSocket};
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::client::{Client, Running};
+
+    const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
+    const PATIENCE: Duration = Duration::from_secs(3);
+
+    struct Rig {
+        engine: Engine,
+        buf: Vec<u8>,
+        _commands: mpsc::SyncSender<Command>,
+        _events: async_mpsc::Receiver<Event>,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let bind = SocketAddr::from((LOOPBACK, 0));
+            let mut config = Config::new(bind, LOOPBACK.into());
+            config.bwe_start_kbps = None;
+            let (commands, inbox) = mpsc::sync_channel(8);
+            let (events, outbox) = async_mpsc::channel(1024);
+            let alive = Arc::new(AtomicBool::new(true));
+            let (engine, _waker) = Engine::bind(config, inbox, events, alive).expect("bind");
+            Self {
+                engine,
+                buf: vec![0; DATAGRAM],
+                _commands: commands,
+                _events: outbox,
+            }
+        }
+
+        /// Joins a client and runs whole turns until it and everyone else are connected.
+        fn join(&mut self, user_id: &str, marker: u8) -> Running {
+            let mut client = Client::new(SocketAddr::from((LOOPBACK, 0)), 3).expect("client");
+            let offer = client.offer().to_string();
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let now = Instant::now();
+            self.engine
+                .join("r".to_string(), user_id.to_string(), &offer, reply, now);
+            let answer = answer.blocking_recv().expect("reply").expect("answer");
+            client.accept(&answer.sdp).expect("accept");
+            let running = client.start(marker).expect("start");
+            let deadline = Instant::now() + PATIENCE;
+            while !self.engine.peers.values().all(|peer| peer.connected) {
+                assert!(Instant::now() < deadline, "never connected");
+                self.engine.read(&mut self.buf);
+                self.engine.tick(Instant::now());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            running
+        }
+    }
+
+    #[test]
+    fn a_forwarded_frame_leaves_before_the_turn_ends() {
+        let mut rig = Rig::new();
+        let speaker = rig.join("a", b'A');
+        let listener = rig.join("b", b'B');
+        // Packets from a listener would also move its `Rtc` along, so this one sends none.
+        listener.stop();
+        speaker.send_payload(Some(vec![0x55; 1000]));
+        speaker.sending(true);
+        let before = rig.engine.egress;
+        let deadline = Instant::now() + PATIENCE;
+        // Only the socket is read, with no `tick`, which is all that used to send these. RTCP
+        // and STUN for the speaker are far smaller than this many frames.
+        while rig.engine.egress - before < 30_000 {
+            assert!(Instant::now() < deadline, "nothing left for the listener");
+            rig.engine.read(&mut rig.buf);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_read_stops_at_its_cap_and_says_more_is_waiting() {
+        let mut rig = Rig::new();
+        let sender = StdUdpSocket::bind((LOOPBACK, 0)).expect("bind");
+        for _ in 0..READ_BATCH + 10 {
+            sender
+                .send_to(&[0x80; 32], rig.engine.public)
+                .expect("send");
+        }
+        // Loopback delivers before `send_to` returns, on every platform these tests run on.
+        assert!(rig.engine.read(&mut rig.buf), "more should be waiting");
+        assert!(!rig.engine.read(&mut rig.buf), "the rest was under the cap");
     }
 }
