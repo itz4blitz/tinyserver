@@ -43,8 +43,9 @@ const LISTENER: Token = Token(2);
 const FIRST_STREAM: usize = 3;
 /// Bytes read from one TCP stream per turn of the loop, so one cannot starve the rest.
 const STREAM_READ: usize = 64 * 1024;
-/// Port 0 picks a UDP port, and TCP may already hold that number. Tries before giving up.
-const BIND_TRIES: usize = 16;
+/// Port 0 picks a UDP port, and TCP may already hold that number, or on Windows have reserved
+/// a run of ports around it. Tries before giving up.
+const BIND_TRIES: usize = 256;
 /// The loop wakes at least this often.
 const TICK: Duration = Duration::from_millis(50);
 /// Larger than any datagram str0m sends or accepts.
@@ -1702,7 +1703,7 @@ fn bind(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, u16)> {
             }
             Err(error)
                 if addr.port() == 0
-                    && error.kind() == ErrorKind::AddrInUse
+                    && matches!(error.kind(), ErrorKind::AddrInUse | ErrorKind::PermissionDenied)
                     && tries < BIND_TRIES => {}
             Err(error) => return Err(error),
         }
