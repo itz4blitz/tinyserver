@@ -62,6 +62,9 @@ const LOAD_EVERY: Duration = Duration::from_secs(5);
 const AUDIO_BURST: u32 = 2;
 /// Video slots are planned again at least this often.
 const PLAN_EVERY: Duration = Duration::from_millis(50);
+/// Who is speaking and which TCP streams expired are looked at this often. They scan every
+/// room and stream, and the loop turns thousands of times a second under load.
+const SCAN_EVERY: Duration = Duration::from_millis(50);
 
 type PeerId = u64;
 /// One layer of one publisher's camera, or their share.
@@ -159,8 +162,6 @@ struct Peer {
     /// The client's microphone m-line.
     publish: Option<Mid>,
     slots: Slots<Mid, PeerId>,
-    /// Receive m-lines were added since the slots were last filled.
-    new_slots: bool,
     /// The last slot map sent for this listener.
     told: Vec<Slot>,
     connected: bool,
@@ -377,6 +378,8 @@ struct Sink<'a> {
     forward: &'a mut VecDeque<(PeerId, MediaData)>,
     /// Listeners who asked for a keyframe on their video slot.
     asks: &'a mut Vec<PeerId>,
+    /// Participants with new receive m-lines.
+    fresh: &'a mut Vec<PeerId>,
 }
 
 pub(crate) struct Engine {
@@ -401,6 +404,8 @@ pub(crate) struct Engine {
     rooms: HashMap<String, Room>,
     forward: VecDeque<(PeerId, MediaData)>,
     asks: Vec<PeerId>,
+    /// Participants whose `Rtc` reported new receive m-lines since the slots were last filled.
+    fresh: Vec<PeerId>,
     /// Something changed that moves video slots; plan them at the next tick.
     replan: bool,
     planned_at: Instant,
@@ -410,6 +415,8 @@ pub(crate) struct Engine {
     counts: Counts,
     load_at: Instant,
     swept_at: Instant,
+    /// The last look at who is speaking and which streams expired.
+    scanned_at: Instant,
 }
 
 /// What the media thread dropped or asked for since the last time it reported.
@@ -480,6 +487,7 @@ impl Engine {
             rooms: HashMap::new(),
             forward: VecDeque::new(),
             asks: Vec::new(),
+            fresh: Vec::new(),
             replan: false,
             planned_at: now,
             next_id: 0,
@@ -488,6 +496,7 @@ impl Engine {
             counts: Counts::default(),
             load_at: now,
             swept_at: now,
+            scanned_at: now,
         };
         Ok((engine, waker))
     }
@@ -802,7 +811,6 @@ impl Engine {
             rtc,
             publish: None,
             slots: Slots::new(),
-            new_slots: false,
             told: Vec::new(),
             connected: false,
             joined_at: now,
@@ -1218,17 +1226,13 @@ impl Engine {
         Some(id)
     }
 
-    /// Fills the slots of everyone whose `Rtc` reported new receive m-lines.
+    /// Fills the slots of everyone in `fresh`.
     fn settle(&mut self) {
-        let fresh: Vec<PeerId> = self
-            .peers
-            .iter_mut()
-            .filter(|(_, peer)| peer.new_slots)
-            .map(|(id, peer)| {
-                peer.new_slots = false;
-                *id
-            })
-            .collect();
+        if self.fresh.is_empty() {
+            return;
+        }
+        let mut fresh = std::mem::take(&mut self.fresh);
+        fresh.dedup();
         for id in fresh {
             self.reseat(id);
             self.tell_slots(id);
@@ -1279,11 +1283,17 @@ impl Engine {
             self.remove(id, Some(lost));
         }
 
-        self.speaking(now);
+        let sweep = now.saturating_duration_since(self.scanned_at) >= SCAN_EVERY;
+        if sweep {
+            self.scanned_at = now;
+            self.speaking(now);
+        }
         if self.replan || now.saturating_duration_since(self.planned_at) >= PLAN_EVERY {
             self.plan(now);
         }
-        self.expire_streams(now);
+        if sweep {
+            self.expire_streams(now);
+        }
         if now.saturating_duration_since(self.swept_at) >= Duration::from_secs(1) {
             self.swept_at = now;
             self.sources
@@ -1361,6 +1371,7 @@ impl Engine {
             egress: &mut self.egress,
             forward: &mut self.forward,
             asks: &mut self.asks,
+            fresh: &mut self.fresh,
         };
         drain(id, peer, &mut sink);
     }
@@ -1392,8 +1403,10 @@ impl Engine {
                 self.counts.audio_dropped += 1;
                 continue;
             }
-            let room_id = publisher.room_id.clone();
-            for listener in self.members(&room_id) {
+            let Some(room) = self.rooms.get(&publisher.room_id) else {
+                continue;
+            };
+            for &listener in &room.members {
                 if listener == origin {
                     continue;
                 }
@@ -1425,6 +1438,7 @@ impl Engine {
                     egress: &mut self.egress,
                     forward: &mut self.forward,
                     asks: &mut self.asks,
+                    fresh: &mut self.fresh,
                 };
                 release(listener, peer, &mut sink, now);
             }
@@ -1461,16 +1475,23 @@ impl Engine {
                 tracing::debug!(call_id = %publisher.call_id, reason = "budget", "media dropped");
             }
         }
-        let room_id = publisher.room_id.clone();
         if !pass || !data.contiguous {
             self.ask_keyframe(origin, layer, now);
         }
         if !pass {
             return;
         }
+        let Some(room) = self
+            .peers
+            .get(&origin)
+            .and_then(|publisher| self.rooms.get(&publisher.room_id))
+        else {
+            return;
+        };
         let source = (origin, layer);
         let time = data.time.rebase(Frequency::NINETY_KHZ).numer();
-        for listener in self.members(&room_id) {
+        let mut switched_listeners = Vec::new();
+        for &listener in &room.members {
             if listener == origin {
                 continue;
             }
@@ -1508,11 +1529,15 @@ impl Engine {
                 egress: &mut self.egress,
                 forward: &mut self.forward,
                 asks: &mut self.asks,
+                fresh: &mut self.fresh,
             };
             release(listener, peer, &mut sink, now);
             if switched {
-                self.tell_slots(listener);
+                switched_listeners.push(listener);
             }
+        }
+        for listener in switched_listeners {
+            self.tell_slots(listener);
         }
     }
 
@@ -1726,7 +1751,7 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                         }
                         Direction::SendOnly => {
                             peer.slots.add_mid(added.mid);
-                            peer.new_slots = true;
+                            sink.fresh.push(id);
                         }
                         _ => {}
                     }
