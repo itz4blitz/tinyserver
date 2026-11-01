@@ -74,6 +74,24 @@ async fn a_paused_listener_comes_back_with_twcc_on() {
     assert!(sees(&b, b'A').await[0].keyframe);
 }
 
+/// A still screen sends next to nothing, so the estimate has nothing to measure and says little.
+/// A real call lost its share this way: the slot went empty and never came back.
+#[tokio::test]
+async fn a_still_screen_keeps_its_share_on_a_low_estimate() {
+    let mut config = config();
+    config.bwe_start_kbps = Some(200);
+    let mut sfu = start(config);
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    assert_eq!(sfu.share_at(&a, true, 20).await, Ok(true));
+    sfu.video_is(&b.call_id, "a", sfu::VideoKind::Share).await;
+    sees(&b, b'A').await;
+    // Thirty holds.
+    let seen = seen_over(&b, Duration::from_secs(3)).await;
+    assert!(seen.len() >= 30, "{} frames", seen.len());
+    assert!(seen.iter().all(|frame| frame.layer == b's'));
+}
+
 /// A listener that has had no video has an idle estimate, far below what a share needs. It gets
 /// the share anyway, and keeps it past the hold if the link carries it.
 #[tokio::test]

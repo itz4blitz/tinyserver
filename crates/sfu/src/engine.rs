@@ -35,7 +35,7 @@ use crate::limit::Bucket;
 use crate::room::{Announced, Slots, Speech};
 use crate::sdp;
 use crate::tcp::{Conn, Readout};
-use crate::video::{self, Ceiling, Fit, Floor, Layer, Link, Quality, Rebase, ShareGate};
+use crate::video::{self, Ceiling, Fit, Floor, Layer, Link, Quality, Reading, Rebase};
 use crate::{Answer, Command, Config, Event, Lost, Refused, Reply, Slot, VideoKind, VideoSlot};
 
 const SOCKET: Token = Token(0);
@@ -162,7 +162,6 @@ struct Screen {
     probing: Option<u64>,
     /// What this listener's link has room for.
     link: Link,
-    share_gate: ShareGate,
 }
 
 struct Peer {
@@ -211,6 +210,16 @@ struct Peer {
     audio_sent: u64,
     /// That audio as a rate, in kb/s, measured every second. It comes off the estimate.
     audio_kbps: u64,
+    /// The same for video, with headers: what the link was asked to carry.
+    video_sent: u64,
+    video_kbps: u64,
+    /// The share of what was sent to this listener that TWCC says was lost in the last second.
+    loss: Option<f32>,
+    /// The latest round trip, and the lowest yet: the difference is a queue on the path.
+    rtt: Option<Duration>,
+    rtt_least: Option<Duration>,
+    /// The link showed it is full in the last second.
+    congested: bool,
     told_video: Option<VideoSlot>,
     timeout: Instant,
     lost: Option<Lost>,
@@ -236,19 +245,6 @@ impl Peer {
             Layer::Share => self.share_live(),
             Layer::High | Layer::Low => self.camera_live(),
         }
-    }
-
-    fn estimate(&self) -> Option<u64> {
-        match (self.twcc, self.remb) {
-            (Some(twcc), Some(remb)) => Some(twcc.min(remb)),
-            (twcc, remb) => twcc.or(remb),
-        }
-    }
-
-    /// The estimate less the audio this listener is getting, in kb/s.
-    fn room_for_video(&self) -> Option<u64> {
-        let estimate = self.estimate()?;
-        Some(estimate.saturating_sub(self.audio_kbps))
     }
 }
 
@@ -890,6 +886,12 @@ impl Engine {
             remb: None,
             audio_sent: 0,
             audio_kbps: 0,
+            video_sent: 0,
+            video_kbps: 0,
+            loss: None,
+            rtt: None,
+            rtt_least: None,
+            congested: false,
             told_video: None,
             timeout: now,
             lost: None,
@@ -1361,6 +1363,35 @@ impl Engine {
             for peer in self.peers.values_mut() {
                 let sent = std::mem::take(&mut peer.audio_sent);
                 peer.audio_kbps = sent.saturating_mul(8) / since.as_millis().max(1) as u64;
+                let sent = std::mem::take(&mut peer.video_sent);
+                peer.video_kbps = sent.saturating_mul(8) / since.as_millis().max(1) as u64;
+                let queue = peer
+                    .rtt
+                    .zip(peer.rtt_least)
+                    .map(|(rtt, least)| rtt.saturating_sub(least));
+                peer.congested = video::congested(
+                    peer.audio_kbps + peer.video_kbps,
+                    peer.twcc,
+                    peer.loss,
+                    queue,
+                );
+                if let Some(screen) = &peer.screen {
+                    tracing::debug!(
+                        call_id = %peer.call_id,
+                        twcc = ?peer.twcc,
+                        remb = ?peer.remb,
+                        audio_kbps = peer.audio_kbps,
+                        video_kbps = peer.video_kbps,
+                        loss = ?peer.loss,
+                        queue_ms = ?queue.map(|queue| queue.as_millis()),
+                        congested = peer.congested,
+                        probing = ?screen.probing,
+                        showing = ?screen.showing.map(|(_, layer)| layer),
+                        wanted = ?screen.wanted.map(|(_, layer)| layer),
+                        fit = ?screen.link.fit(),
+                        "link"
+                    );
+                }
             }
             self.sources
                 .retain(|_, bucket| now.saturating_duration_since(bucket.used()) < SOURCE_IDLE);
@@ -1608,6 +1639,7 @@ impl Engine {
                 continue;
             };
             let at = MediaTime::new(out, Frequency::NINETY_KHZ);
+            peer.video_sent += u64::from(size) + AUDIO_HEADERS;
             if let Err(error) = writer.write(pt, data.network_time, at, data.data.clone()) {
                 tracing::warn!(call_id = %peer.call_id, direction = "video", reason = crate::rtc_reason(&error), "media failed");
                 peer.rtc.disconnect();
@@ -1711,47 +1743,22 @@ impl Engine {
         }
     }
 
-    /// `id` waits for a layer its publisher is not sending, while the other one flows: a
-    /// publisher without simulcast, say. Only a better fit can show them anything. Waiting for
-    /// the keyframe of a layer that flows, or for a first frame, is not this: the estimate says
-    /// nothing yet then, and taking it would throw away a fit that was measured.
-    fn stuck(&self, id: PeerId, now: Instant) -> bool {
-        let wanted = self
-            .peers
-            .get(&id)
-            .and_then(|peer| peer.screen.as_ref())
-            .and_then(|screen| screen.wanted.filter(|_| screen.wanted != screen.showing));
-        let Some((publisher, layer)) = wanted else {
-            return false;
-        };
-        self.peers.get(&publisher).is_some_and(|publisher| {
-            let fresh = |layer: Layer| publisher.layers[layer.index()].fresh(now);
-            !fresh(layer) && fresh(layer.other())
-        })
-    }
-
     fn plan_screen(&mut self, id: PeerId, ceiling: Ceiling, now: Instant) {
         let hold = self.config.layer_hold;
-        let stuck = self.stuck(id, now);
         let Some(peer) = self.peers.get_mut(&id) else {
             return;
         };
-        let spare = peer.room_for_video();
+        let audio = peer.audio_kbps;
+        let reading = Reading {
+            told: peer.remb.map(|remb| remb.saturating_sub(audio)),
+            estimate: peer.twcc.map(|twcc| twcc.saturating_sub(audio)),
+            congested: peer.congested,
+        };
         let Some(screen) = peer.screen.as_mut() else {
             return;
         };
-        // With no video going out the estimator has nothing to measure, and sinks to about what
-        // it was last told to probe for. That says nothing about the link, unless this listener
-        // was held back: then str0m pads the stream to find out, and the estimate is the way back.
-        let measured = screen.showing.is_some()
-            || screen.link.paused()
-            || screen.share_gate.refused()
-            || stuck;
-        let fit = screen.link.update(spare.filter(|_| measured), hold, now);
-        let showing_share = screen
-            .showing
-            .is_some_and(|(_, layer)| layer == Layer::Share);
-        let share_fits = screen.share_gate.allows(showing_share, fit, hold, now);
+        let fit = screen.link.update(reading, hold, now);
+        let share_fits = fit.is_none_or(|fit| fit >= Fit::Share);
         let Some(peer) = self.peers.get(&id) else {
             return;
         };
@@ -1817,9 +1824,6 @@ impl Engine {
         let Some(screen) = peer.screen.as_mut() else {
             return;
         };
-        if share.is_none() {
-            screen.share_gate = ShareGate::default();
-        }
         let changed = screen.showing != showing;
         screen.wanted = wanted;
         screen.showing = showing;
@@ -1917,7 +1921,6 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                                 rebase: Rebase::default(),
                                 probing: None,
                                 link: Link::default(),
-                                share_gate: ShareGate::default(),
                             });
                         }
                         Direction::RecvOnly | Direction::SendRecv | Direction::Inactive
@@ -1942,6 +1945,11 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                     if peer.screen.as_ref().map(|screen| screen.mid) == Some(request.mid) =>
                 {
                     sink.asks.push(id);
+                }
+                RtcEvent::PeerStats(stats) => {
+                    peer.loss = stats.egress_loss_fraction;
+                    peer.rtt = stats.rtt;
+                    peer.rtt_least = peer.rtt_least.min(stats.rtt).or(stats.rtt);
                 }
                 RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
                     peer.twcc = Some(kbps(estimate));
@@ -2032,7 +2040,8 @@ pub(crate) fn rtc_config(
             .set_dtls_cert(cert.clone())
             .clear_codecs()
             .enable_opus(true, false)
-            .enable_bwe(bwe_kbps.map(|kbps| Bitrate::kbps(u64::from(kbps)))),
+            .enable_bwe(bwe_kbps.map(|kbps| Bitrate::kbps(u64::from(kbps))))
+            .set_stats_interval(Some(Duration::from_secs(1))),
     );
     config
         .codec_config()
