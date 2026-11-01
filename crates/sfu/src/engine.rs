@@ -24,7 +24,7 @@ use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::SdpOffer;
 use str0m::config::{CryptoProvider, DtlsCert};
 use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaData, MediaKind, MediaTime};
-use str0m::media::{Mid, Rid};
+use str0m::media::{Mid, Pt, Rid};
 use str0m::net::{DatagramRecv, Protocol, Receive, TcpType};
 use str0m::{Candidate, Event as RtcEvent, Input, Output, Rtc, RtcConfig};
 use tokio::sync::mpsc as async_mpsc;
@@ -161,6 +161,8 @@ struct Peer {
     rtc: Rtc,
     /// The client's microphone m-line.
     publish: Option<Mid>,
+    /// The payload type audio goes to them on, for putting it first on a TCP stream.
+    audio_pt: Option<Pt>,
     slots: Slots<Mid, PeerId>,
     /// The last slot map sent for this listener.
     told: Vec<Slot>,
@@ -273,13 +275,14 @@ struct Tcp {
 }
 
 impl Tcp {
-    /// Frames `packet` onto the stream from `to`. Dropped if there is none or it is backed up.
-    fn send(&mut self, to: SocketAddr, packet: &[u8]) {
+    /// Frames `packet` onto the stream from `to`, ahead of waiting video if `urgent`. Dropped
+    /// if there is none or it is backed up.
+    fn send(&mut self, to: SocketAddr, packet: &[u8], urgent: bool) {
         let Some(token) = self.by_peer.get(&to).copied() else {
             return;
         };
         if let Some(stream) = self.streams.get_mut(&token) {
-            if stream.conn.queue(packet) {
+            if stream.conn.queue(packet, urgent) {
                 self.flush(token);
             }
         }
@@ -810,6 +813,7 @@ impl Engine {
             user_id,
             rtc,
             publish: None,
+            audio_pt: None,
             slots: Slots::new(),
             told: Vec::new(),
             connected: false,
@@ -1425,9 +1429,9 @@ impl Engine {
                 let Some(pt) = writer.match_params(data.params) else {
                     continue;
                 };
-                if let Err(error) =
-                    writer.write(pt, data.network_time, data.time, data.data.clone())
-                {
+                let written = writer.write(pt, data.network_time, data.time, data.data.clone());
+                peer.audio_pt = Some(pt);
+                if let Err(error) = written {
                     tracing::warn!(call_id = %peer.call_id, direction = "audio", reason = crate::rtc_reason(&error), "media failed");
                     peer.rtc.disconnect();
                 }
@@ -1726,7 +1730,10 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
             Output::Transmit(transmit) => {
                 *sink.egress += transmit.contents.len() as u64;
                 if transmit.proto == Protocol::Tcp {
-                    sink.tcp.send(transmit.destination, &transmit.contents);
+                    let urgent = peer.audio_pt.is_some()
+                        && payload_type(&transmit.contents) == peer.audio_pt;
+                    sink.tcp
+                        .send(transmit.destination, &transmit.contents, urgent);
                 } else if let Err(error) = sink
                     .socket
                     .send_to(&transmit.contents, transmit.destination)
@@ -1902,6 +1909,15 @@ pub(crate) fn candidates(
         .collect()
 }
 
+/// The payload type of an RTP packet, whose header SRTP leaves in the clear. RTCP reads as a
+/// number below the dynamic range, so it never matches a media type. RFC 7983 says which is RTP.
+fn payload_type(packet: &[u8]) -> Option<Pt> {
+    match packet {
+        [128..=191, marker_and_type, ..] => Some((marker_and_type & 0x7f).into()),
+        _ => None,
+    }
+}
+
 /// RFC 7983: a first byte of 0 to 3 is STUN.
 fn is_stun(packet: &[u8]) -> bool {
     packet.first().is_some_and(|byte| *byte < 4)
@@ -2009,6 +2025,19 @@ mod tests {
         healthy.arrived = true;
         assert!(!healthy.may_ask(start), "a keyframe just came");
         assert!(healthy.may_ask(start + video::KEYFRAME_EVERY));
+    }
+
+    #[test]
+    fn the_payload_type_is_read_from_rtp_only() {
+        let opus: Pt = 111.into();
+        assert_eq!(payload_type(&[0x80, 111, 0, 1]), Some(opus));
+        // The marker bit is not part of it.
+        assert_eq!(payload_type(&[0x80, 0x80 | 111, 0, 1]), Some(opus));
+        // A sender report, DTLS, and STUN.
+        assert_ne!(payload_type(&[0x80, 200, 0, 6]), Some(opus));
+        assert_eq!(payload_type(&[22, 254, 253]), None);
+        assert_eq!(payload_type(&[0, 1, 0, 0]), None);
+        assert_eq!(payload_type(&[0x80]), None);
     }
 
     fn left(call_id: &str) -> Event {

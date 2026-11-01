@@ -517,7 +517,7 @@ impl Client {
                         free.insert((token, Conn::new(socket, to)))
                     }
                 };
-                if conn.queue(packet) && conn.flush().is_err() {
+                if conn.queue(packet, false) && conn.flush().is_err() {
                     streams.remove(&to);
                 }
             }
