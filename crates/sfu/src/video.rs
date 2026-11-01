@@ -175,8 +175,16 @@ pub(crate) struct ShareGate {
 }
 
 impl ShareGate {
-    /// `showing`: the slot carries the share now. `fits`: the link has room for one.
-    pub fn allows(&mut self, showing: bool, fits: bool, hold: Duration, now: Instant) -> bool {
+    /// `showing`: the slot carries the share now. `fit`: what the link has room for. A link that
+    /// cannot take video at all gets no try: the audio on it would pay for one.
+    pub fn allows(
+        &mut self,
+        showing: bool,
+        fit: Option<Fit>,
+        hold: Duration,
+        now: Instant,
+    ) -> bool {
+        let fits = fit.is_none_or(|fit| fit >= Fit::Share);
         if fits {
             self.refused = false;
         }
@@ -188,7 +196,7 @@ impl ShareGate {
         } else {
             self.showing_since = None;
         }
-        !self.refused
+        !self.refused && fit != Some(Fit::Audio)
     }
 
     pub fn refused(&self) -> bool {
@@ -436,15 +444,31 @@ mod tests {
     fn a_share_gets_a_fair_try_then_gives_way_until_the_link_has_room() {
         let start = Instant::now();
         let mut gate = ShareGate::default();
-        assert!(gate.allows(false, false, HOLD, start), "never tried");
-        assert!(gate.allows(true, false, HOLD, start));
+        let small = Some(Fit::Low);
+        let room = Some(Fit::Share);
+        assert!(gate.allows(false, small, HOLD, start), "never tried");
+        assert!(gate.allows(true, small, HOLD, start));
         let almost = start + HOLD - Duration::from_millis(1);
-        assert!(gate.allows(true, false, almost - start, start));
-        assert!(!gate.allows(true, false, HOLD, start + HOLD));
+        assert!(gate.allows(true, small, almost - start, start));
+        assert!(!gate.allows(true, small, HOLD, start + HOLD));
         assert!(gate.refused());
-        assert!(!gate.allows(false, false, HOLD, start + HOLD));
-        assert!(gate.allows(false, true, HOLD, start + HOLD * 2));
+        assert!(!gate.allows(false, small, HOLD, start + HOLD));
+        assert!(gate.allows(false, room, HOLD, start + HOLD * 2));
         assert!(!gate.refused());
+    }
+
+    #[test]
+    fn a_share_is_not_tried_on_a_link_paused_for_audio() {
+        let start = Instant::now();
+        let mut gate = ShareGate::default();
+        assert!(!gate.allows(false, Some(Fit::Audio), HOLD, start));
+        assert!(!gate.refused());
+        // One showing when the link falls that far goes at once, without waiting out the hold.
+        let mut gate = ShareGate::default();
+        assert!(gate.allows(true, Some(Fit::Low), HOLD, start));
+        assert!(!gate.allows(true, Some(Fit::Audio), HOLD, start));
+        // With no estimate yet it still gets its try.
+        assert!(ShareGate::default().allows(false, None, HOLD, start));
     }
 
     #[test]

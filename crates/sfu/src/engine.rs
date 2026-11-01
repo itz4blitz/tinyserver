@@ -1715,10 +1715,7 @@ impl Engine {
         let showing_share = screen
             .showing
             .is_some_and(|(_, layer)| layer == Layer::Share);
-        let room_for_share = fit.is_none_or(|fit| fit >= Fit::Share);
-        let share_fits = screen
-            .share_gate
-            .allows(showing_share, room_for_share, hold, now);
+        let share_fits = screen.share_gate.allows(showing_share, fit, hold, now);
         let Some(peer) = self.peers.get(&id) else {
             return;
         };
