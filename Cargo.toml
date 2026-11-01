@@ -45,6 +45,10 @@ url = "2"
 # discoverable (username-less) sign-in. Attestation stays off: sign-in asks for none.
 webauthn-rs = { version = "=0.6.2", default-features = false, features = ["danger-allow-state-serialisation", "conditional-ui"] }
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
