@@ -85,7 +85,10 @@ pub struct Config {
     /// A connected participant silent for this long is dropped. No packet at all, not even
     /// a STUN consent check.
     pub consent_timeout: Duration,
-    /// Audio a publisher may send, in kb/s of payload. Frames over it are not forwarded.
+    /// Audio a publisher may send, in kb/s of payload, with a burst of two seconds of it.
+    /// Frames over it are not forwarded. Clients encode at the room's bitrate, up to 128 kb/s;
+    /// this leaves room for an encrypted frame's seal and Opus running over in loud passages,
+    /// so it only ever stops abuse.
     pub audio_kbps: u32,
     /// Camera video a publisher may send on each simulcast layer, in kb/s of payload, from a
     /// bucket of one second. A frame over it is dropped, and so is that layer until its next
@@ -130,7 +133,7 @@ impl Config {
             lan_ip: None,
             connect_timeout: Duration::from_secs(15),
             consent_timeout: Duration::from_secs(30),
-            audio_kbps: 64,
+            audio_kbps: 192,
             camera_high_kbps: 2400,
             camera_low_kbps: 700,
             share_kbps: 5000,

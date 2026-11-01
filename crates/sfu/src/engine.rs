@@ -55,6 +55,8 @@ const SOURCES: usize = 4096;
 /// A source silent this long loses its budget entry.
 const SOURCE_IDLE: Duration = Duration::from_secs(10);
 const LOAD_EVERY: Duration = Duration::from_secs(5);
+/// Seconds of `audio_kbps` a publisher may run ahead of it, for a burst after a stall.
+const AUDIO_BURST: u32 = 2;
 /// Video slots are planned again at least this often.
 const PLAN_EVERY: Duration = Duration::from_millis(50);
 
@@ -322,8 +324,16 @@ pub(crate) struct Engine {
     next_id: u64,
     ids: RandomState,
     egress: u64,
+    counts: Counts,
     load_at: Instant,
     swept_at: Instant,
+}
+
+/// What the media thread dropped or asked for since the last time it reported.
+#[derive(Debug, Default)]
+struct Counts {
+    /// Audio frames over a publisher's budget.
+    audio_dropped: u64,
 }
 
 /// Marks the thread stopped however it ends, a panic included.
@@ -387,6 +397,7 @@ impl Engine {
             next_id: 0,
             ids: RandomState::new(),
             egress: 0,
+            counts: Counts::default(),
             load_at: now,
             swept_at: now,
         };
@@ -692,7 +703,6 @@ impl Engine {
         self.next_id += 1;
         let id = self.next_id;
         let call_id = self.call_id();
-        let rate = self.config.audio_kbps.saturating_mul(1000) / 8;
         let peer = Peer {
             call_id: call_id.clone(),
             room_id: room_id.clone(),
@@ -710,7 +720,7 @@ impl Engine {
             silenced: false,
             hushed: false,
             speech: Speech::new(),
-            audio: Bucket::new(rate, rate, now),
+            audio: audio_budget(self.config.audio_kbps, now),
             camera: None,
             camera_on: false,
             share: None,
@@ -1295,6 +1305,7 @@ impl Engine {
             publisher.speech.hear(data.ext_vals.audio_level, now);
             let size = u32::try_from(data.data.len()).unwrap_or(u32::MAX);
             if !publisher.audio.take(size, now) {
+                self.counts.audio_dropped += 1;
                 continue;
             }
             let room_id = publisher.room_id.clone();
@@ -1710,6 +1721,12 @@ fn bind(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, u16)> {
     }
 }
 
+/// What one publisher's audio may spend.
+fn audio_budget(kbps: u32, now: Instant) -> Bucket {
+    let rate = kbps.saturating_mul(1000) / 8;
+    Bucket::new(rate, rate.saturating_mul(AUDIO_BURST), now)
+}
+
 /// A missing audio packet is released at once. str0m's default holds it until 15 later
 /// packets arrive or a second passes, and every listener has gone silent by then. Video is
 /// left to its own, larger, hold.
@@ -1799,6 +1816,43 @@ fn hint(events: &async_mpsc::Sender<Event>, event: Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    /// A room's highest bitrate in 20 ms frames, and the tag, nonce and marker of a seal.
+    const SEALED_FRAME: u32 = 128_000 / 8 / 50 + 16;
+
+    fn defaults() -> Config {
+        let any = Ipv4Addr::LOCALHOST;
+        Config::new(SocketAddr::from((any, 0)), any.into())
+    }
+
+    #[test]
+    fn thirty_seconds_at_the_highest_room_bitrate_all_pass_the_audio_budget() {
+        let start = Instant::now();
+        let mut budget = audio_budget(defaults().audio_kbps, start);
+        for frame in 0..1500 {
+            let at = start + Duration::from_millis(frame * 20);
+            assert!(budget.take(SEALED_FRAME, at), "frame {frame} dropped");
+        }
+    }
+
+    #[test]
+    fn voice_bitrate_overshoot_passes_the_audio_budget_and_a_flood_does_not() {
+        let start = Instant::now();
+        let mut budget = audio_budget(defaults().audio_kbps, start);
+        // Half again over the bitrate through a loud passage of 10 s.
+        for frame in 0..500 {
+            let at = start + Duration::from_millis(frame * 20);
+            assert!(budget.take(SEALED_FRAME * 3 / 2, at), "frame {frame}");
+        }
+        // Then four times the room's top rate, which no client sends.
+        let mut dropped = 0;
+        for frame in 500..2000 {
+            let at = start + Duration::from_millis(frame * 20);
+            dropped += u32::from(!budget.take(SEALED_FRAME * 4, at));
+        }
+        assert!(dropped > 500, "only {dropped} of 1500 dropped");
+    }
 
     #[test]
     fn a_missing_audio_packet_is_not_held_for_fifteen_later_ones() {
