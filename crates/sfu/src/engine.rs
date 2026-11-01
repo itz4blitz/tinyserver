@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use mio::event::Event as Ready;
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
+use socket2::SockRef;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::SdpOffer;
 use str0m::config::{CryptoProvider, DtlsCert};
@@ -51,6 +52,9 @@ const STREAM_READ: usize = 64 * 1024;
 const BIND_TRIES: usize = 256;
 /// The loop wakes at least this often.
 const TICK: Duration = Duration::from_millis(50);
+/// What the UDP socket asks the kernel to buffer each way. Enough for a burst of keyframes to
+/// everyone without a drop. Linux silently caps it at `net.core.rmem_max` and `wmem_max`.
+const SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 /// Larger than any datagram str0m sends or accepts.
 const DATAGRAM: usize = 2000;
 /// Source addresses with a packet budget. A new source past this is dropped.
@@ -276,16 +280,19 @@ struct Tcp {
 
 impl Tcp {
     /// Frames `packet` onto the stream from `to`, ahead of waiting video if `urgent`. Dropped
-    /// if there is none or it is backed up.
-    fn send(&mut self, to: SocketAddr, packet: &[u8], urgent: bool) {
+    /// if there is none or it is backed up, and then false.
+    fn send(&mut self, to: SocketAddr, packet: &[u8], urgent: bool) -> bool {
         let Some(token) = self.by_peer.get(&to).copied() else {
-            return;
+            return false;
         };
-        if let Some(stream) = self.streams.get_mut(&token) {
-            if stream.conn.queue(packet, urgent) {
-                self.flush(token);
-            }
+        let queued = self
+            .streams
+            .get_mut(&token)
+            .is_some_and(|stream| stream.conn.queue(packet, urgent));
+        if queued {
+            self.flush(token);
         }
+        queued
     }
 
     /// Writes the backlog, and watches for writable only while some is left.
@@ -383,6 +390,7 @@ struct Sink<'a> {
     asks: &'a mut Vec<PeerId>,
     /// Participants with new receive m-lines.
     fresh: &'a mut Vec<PeerId>,
+    counts: &'a mut Counts,
 }
 
 pub(crate) struct Engine {
@@ -431,6 +439,8 @@ struct Counts {
     video_dropped: u64,
     /// Keyframe requests sent to publishers.
     keyframe_asks: u64,
+    /// Packets the socket or a TCP stream had no room for.
+    send_dropped: u64,
 }
 
 /// Marks the thread stopped however it ends, a panic included.
@@ -1376,6 +1386,7 @@ impl Engine {
             forward: &mut self.forward,
             asks: &mut self.asks,
             fresh: &mut self.fresh,
+            counts: &mut self.counts,
         };
         drain(id, peer, &mut sink);
     }
@@ -1443,6 +1454,7 @@ impl Engine {
                     forward: &mut self.forward,
                     asks: &mut self.asks,
                     fresh: &mut self.fresh,
+                    counts: &mut self.counts,
                 };
                 release(listener, peer, &mut sink, now);
             }
@@ -1534,6 +1546,7 @@ impl Engine {
                 forward: &mut self.forward,
                 asks: &mut self.asks,
                 fresh: &mut self.fresh,
+                counts: &mut self.counts,
             };
             release(listener, peer, &mut sink, now);
             if switched {
@@ -1732,13 +1745,17 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                 if transmit.proto == Protocol::Tcp {
                     let urgent = peer.audio_pt.is_some()
                         && payload_type(&transmit.contents) == peer.audio_pt;
-                    sink.tcp
+                    let sent = sink
+                        .tcp
                         .send(transmit.destination, &transmit.contents, urgent);
+                    sink.counts.send_dropped += u64::from(!sent);
                 } else if let Err(error) = sink
                     .socket
                     .send_to(&transmit.contents, transmit.destination)
                 {
-                    if error.kind() != ErrorKind::WouldBlock {
+                    if error.kind() == ErrorKind::WouldBlock {
+                        sink.counts.send_dropped += 1;
+                    } else {
                         tracing::warn!(call_id = %peer.call_id, direction = "output", reason = "io", "media failed");
                     }
                 }
@@ -1824,6 +1841,7 @@ fn bind(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, u16)> {
         let port = udp.local_addr()?.port();
         match std::net::TcpListener::bind(SocketAddr::new(addr.ip(), port)) {
             Ok(tcp) => {
+                request_buffers(&udp);
                 udp.set_nonblocking(true)?;
                 tcp.set_nonblocking(true)?;
                 return Ok((UdpSocket::from_std(udp), TcpListener::from_std(tcp), port));
@@ -1838,6 +1856,21 @@ fn bind(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, u16)> {
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Asks for `SOCKET_BUFFER` each way and logs what it got, which is an operator's only sign
+/// of a low cap. Linux reports double what it keeps for payload.
+fn request_buffers(udp: &std::net::UdpSocket) {
+    let socket = SockRef::from(udp);
+    if let Err(error) = socket.set_recv_buffer_size(SOCKET_BUFFER) {
+        tracing::warn!(%error, "media receive buffer not set");
+    }
+    if let Err(error) = socket.set_send_buffer_size(SOCKET_BUFFER) {
+        tracing::warn!(%error, "media send buffer not set");
+    }
+    let receive = socket.recv_buffer_size().unwrap_or_default();
+    let send = socket.send_buffer_size().unwrap_or_default();
+    tracing::info!(receive, send, "media socket buffers");
 }
 
 /// What one publisher's audio may spend.
@@ -2163,6 +2196,20 @@ mod turn_tests {
             rig.engine.read(&mut rig.buf);
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn the_socket_asks_for_more_buffer_than_the_default() {
+        let rig = Rig::new();
+        let socket = SockRef::from(&rig.engine.socket);
+        // Windows gives what was asked. Linux caps it, at about 200 KiB on a stock kernel.
+        let least = if cfg!(windows) {
+            SOCKET_BUFFER
+        } else {
+            128 * 1024
+        };
+        assert!(socket.recv_buffer_size().expect("read back") >= least);
+        assert!(socket.send_buffer_size().expect("read back") >= least);
     }
 
     #[test]

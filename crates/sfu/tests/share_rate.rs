@@ -10,7 +10,7 @@ use sfu::VideoKind;
 
 /// A publisher with the camera on, the microphone on, and a share at 2.5 Mb/s sends about
 /// 550 packets a second: 285 for the share, 210 for the two camera layers, 50 for audio, and
-/// RTCP. The default budget of 1,000 a second takes all of it.
+/// RTCP. The default budget of 2,000 a second takes all of it.
 #[tokio::test]
 async fn the_share_is_not_dropped_by_the_packet_limit_at_its_rate() {
     let mut config = config();

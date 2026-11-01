@@ -13,6 +13,7 @@ fuzz = []
 
 [dependencies]
 mio = { version = "1", features = ["os-poll", "net"] }
+socket2 = "0.6"
 # Pinned. str0m breaks its API every few releases; bump on purpose, with the call tests.
 str0m = { version = "=0.24.1", default-features = false, features = ["aws-lc-rs"] }
 tokio = { workspace = true, features = ["sync"] }
