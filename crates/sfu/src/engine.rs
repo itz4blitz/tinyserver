@@ -35,7 +35,7 @@ use crate::limit::Bucket;
 use crate::room::{Announced, Slots, Speech};
 use crate::sdp;
 use crate::tcp::{Conn, Readout};
-use crate::video::{self, Ceiling, Floor, Layer, Quality, Rebase};
+use crate::video::{self, Ceiling, Fit, Floor, Layer, Link, Quality, Rebase};
 use crate::{Answer, Command, Config, Event, Lost, Refused, Reply, Slot, VideoKind, VideoSlot};
 
 const SOCKET: Token = Token(0);
@@ -55,6 +55,8 @@ const TICK: Duration = Duration::from_millis(50);
 /// What the UDP socket asks the kernel to buffer each way. Enough for a burst of keyframes to
 /// everyone without a drop. Linux silently caps it at `net.core.rmem_max` and `wmem_max`.
 const SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+/// What IP, UDP, RTP and SRTP add to a forwarded audio frame, in bytes.
+const AUDIO_HEADERS: u64 = 60;
 /// Larger than any datagram str0m sends or accepts.
 const DATAGRAM: usize = 2000;
 /// Source addresses with a packet budget. A new source past this is dropped.
@@ -156,6 +158,8 @@ struct Screen {
     rebase: Rebase<Source>,
     /// The bitrate the estimator was last told to probe for, in kb/s.
     probing: Option<u64>,
+    /// What this listener's link has room for.
+    link: Link,
 }
 
 struct Peer {
@@ -200,6 +204,10 @@ struct Peer {
     /// TWCC estimator, and the last REMB the client sent.
     twcc: Option<u64>,
     remb: Option<u64>,
+    /// Audio sent to this listener since it was last measured, with headers, in bytes.
+    audio_sent: u64,
+    /// That audio as a rate, in kb/s, measured every second. It comes off the estimate.
+    audio_kbps: u64,
     told_video: Option<VideoSlot>,
     timeout: Instant,
     lost: Option<Lost>,
@@ -232,6 +240,12 @@ impl Peer {
             (Some(twcc), Some(remb)) => Some(twcc.min(remb)),
             (twcc, remb) => twcc.or(remb),
         }
+    }
+
+    /// The estimate less the audio this listener is getting, in kb/s.
+    fn room_for_video(&self) -> Option<u64> {
+        let estimate = self.estimate()?;
+        Some(estimate.saturating_sub(self.audio_kbps))
     }
 }
 
@@ -849,6 +863,8 @@ impl Engine {
             quality: Quality::High,
             twcc: None,
             remb: None,
+            audio_sent: 0,
+            audio_kbps: 0,
             told_video: None,
             timeout: now,
             lost: None,
@@ -1308,8 +1324,13 @@ impl Engine {
         if sweep {
             self.expire_streams(now);
         }
-        if now.saturating_duration_since(self.swept_at) >= Duration::from_secs(1) {
+        let since = now.saturating_duration_since(self.swept_at);
+        if since >= Duration::from_secs(1) {
             self.swept_at = now;
+            for peer in self.peers.values_mut() {
+                let sent = std::mem::take(&mut peer.audio_sent);
+                peer.audio_kbps = sent.saturating_mul(8) / since.as_millis().max(1) as u64;
+            }
             self.sources
                 .retain(|_, bucket| now.saturating_duration_since(bucket.used()) < SOURCE_IDLE);
         }
@@ -1442,6 +1463,7 @@ impl Engine {
                 };
                 let written = writer.write(pt, data.network_time, data.time, data.data.clone());
                 peer.audio_pt = Some(pt);
+                peer.audio_sent += u64::from(size) + AUDIO_HEADERS;
                 if let Err(error) = written {
                     tracing::warn!(call_id = %peer.call_id, direction = "audio", reason = crate::rtc_reason(&error), "media failed");
                     peer.rtc.disconnect();
@@ -1591,7 +1613,8 @@ impl Engine {
     /// live camera other than the listener, else the first such camera in join order, and its
     /// layer from the listener's estimate, their `call.quality`, and the server's upload
     /// budget. A listener keeps what it shows until the wanted source's keyframe. A deafened
-    /// listener gets nothing.
+    /// listener gets nothing, and neither does one whose link has no room for video beside its
+    /// audio. A share gives way to a camera on a link too small for it.
     fn plan(&mut self, now: Instant) {
         self.replan = false;
         self.planned_at = now;
@@ -1637,6 +1660,15 @@ impl Engine {
     }
 
     fn plan_screen(&mut self, id: PeerId, ceiling: Ceiling, now: Instant) {
+        let hold = self.config.layer_hold;
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return;
+        };
+        let spare = peer.room_for_video();
+        let Some(screen) = peer.screen.as_mut() else {
+            return;
+        };
+        let fit = screen.link.update(spare, hold, now);
         let Some(peer) = self.peers.get(&id) else {
             return;
         };
@@ -1654,19 +1686,22 @@ impl Engine {
             .and_then(|room| room.sharer)
             .map(|sharer| (sharer, Layer::Share))
             .filter(sends);
+        let share_fits = fit.is_none_or(|fit| fit >= Fit::Share);
         let ceiling_camera = ceiling.camera;
-        let publisher = room.filter(|_| share.is_none()).and_then(|room| {
-            room.floor
-                .recent()
-                .iter()
-                .chain(&room.members)
-                .find(|other| live(other))
-                .copied()
-        });
-        let most = peer.quality.min(ceiling_camera);
-        let current = screen.wanted.map(|(_, layer)| layer);
+        let publisher = room
+            .filter(|_| share.is_none() || !share_fits)
+            .and_then(|room| {
+                room.floor
+                    .recent()
+                    .iter()
+                    .chain(&room.members)
+                    .find(|other| live(other))
+                    .copied()
+            });
+        let allowed = peer.quality.min(ceiling_camera);
+        let most = allowed.min(fit.map_or(Quality::High, Fit::quality));
         let camera = publisher.and_then(|publisher| {
-            let layer = video::pick_layer(current, peer.estimate(), peer.quality, ceiling_camera)?;
+            let layer = video::pick_layer(fit, peer.quality, ceiling_camera)?;
             let layers = &self.peers.get(&publisher)?.layers;
             let fresh = |layer: Layer| layers[layer.index()].fresh(now);
             let other = layer.other();
@@ -1674,17 +1709,24 @@ impl Engine {
                 !fresh(layer) && fresh(other) && (other == Layer::Low || most == Quality::High);
             Some((publisher, if fallback { other } else { layer }))
         });
-        // A share has one layer, so the estimate does not choose it; `off` and the budget may.
+        // A share has one layer: `off` and the budget may withhold it. On a link too small for
+        // it, a camera's `l` is what can still get through.
+        let wants_share = ceiling.share && peer.quality != Quality::Off;
         let wanted = match share {
-            Some(share) => (ceiling.share && peer.quality != Quality::Off).then_some(share),
-            None => camera,
+            Some(share) if share_fits => wants_share.then_some(share),
+            _ => camera,
         };
         let showing = screen
             .showing
             .filter(|source| wanted.is_some() && sends(source));
+        // Probing asks for what would be shown if the link allowed it, or it could never climb.
+        let paused = publisher.is_some() && camera.is_none() && allowed != Quality::Off;
         let probe = match wanted {
             Some((_, Layer::Share)) => video::SHARE_KBPS,
-            Some(_) if most == Quality::High => video::PROBE_KBPS,
+            _ if share.is_some() && wants_share => video::SHARE_KBPS,
+            Some(_) if allowed == Quality::High => video::PROBE_KBPS,
+            None if paused && allowed == Quality::High => video::PROBE_KBPS,
+            None if paused => video::RESUME_PROBE_KBPS,
             _ => video::LOW_KBPS,
         };
         let Some(peer) = self.peers.get_mut(&id) else {
@@ -1789,6 +1831,7 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                                 wanted: None,
                                 rebase: Rebase::default(),
                                 probing: None,
+                                link: Link::default(),
                             });
                         }
                         Direction::RecvOnly | Direction::SendRecv | Direction::Inactive

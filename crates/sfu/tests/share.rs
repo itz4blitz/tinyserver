@@ -198,3 +198,23 @@ async fn a_tcp_only_client_gets_the_share() {
     sfu.share(&b, true).await.expect("share");
     shown(&mut sfu, &c, "b", b'B').await;
 }
+
+#[tokio::test]
+async fn a_share_gives_way_to_a_camera_on_a_link_too_small_for_it() {
+    let mut sfu = start(config());
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    let c = join(&mut sfu, "r", "c", b'C').await;
+    sfu.camera(&c, true).await;
+    b.running.remb(Some(5000));
+    assert_eq!(sfu.share(&a, true).await, Ok(true));
+    sfu.video_is(&b.call_id, "a", VideoKind::Share).await;
+
+    b.running.remb(Some(600));
+    sfu.video_is(&b.call_id, "c", VideoKind::Camera).await;
+    assert!(sees(&b, b'C').await[0].keyframe);
+
+    b.running.remb(Some(5000));
+    sfu.video_is(&b.call_id, "a", VideoKind::Share).await;
+    sees(&b, b'A').await;
+}

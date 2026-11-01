@@ -11,11 +11,21 @@ pub(crate) const LOW_KBPS: u64 = 350;
 pub(crate) const SHARE_KBPS: u64 = 2500;
 /// One forwarded audio stream with its headers, in kb/s, for the upload budget.
 pub(crate) const AUDIO_KBPS: u64 = 50;
-/// A listener on `l` moves up to `h` at this estimate, and back down below `DOWN_KBPS`.
+/// A listener on `l` moves up to `h` at this much room for video, and back down below
+/// `DOWN_KBPS`.
 pub(crate) const UP_KBPS: u64 = 1600;
 pub(crate) const DOWN_KBPS: u64 = 1300;
+/// A share gives way to a camera below `SHARE_DOWN_KBPS`, and comes back at `SHARE_UP_KBPS`.
+pub(crate) const SHARE_UP_KBPS: u64 = 1000;
+pub(crate) const SHARE_DOWN_KBPS: u64 = 800;
+/// Video pauses below `PAUSE_KBPS`, so it cannot starve the audio of a link that small, and
+/// resumes on a keyframe at `RESUME_KBPS`.
+pub(crate) const PAUSE_KBPS: u64 = 250;
+pub(crate) const RESUME_KBPS: u64 = 450;
 /// What a listener's bandwidth estimator probes for while it wants `h`.
 pub(crate) const PROBE_KBPS: u64 = 2000;
+/// What it probes for while paused, to find `RESUME_KBPS` above whatever audio it gets.
+pub(crate) const RESUME_PROBE_KBPS: u64 = 700;
 /// A layer with no frame for this long is not chosen while the other one is sending.
 pub(crate) const STALE: Duration = Duration::from_secs(1);
 /// Keyframe requests to one layer of one publisher go out at most this often.
@@ -74,32 +84,87 @@ pub enum Quality {
     High,
 }
 
-/// The layer a listener should get. `current` is the one it wants now, for hysteresis.
-/// `estimate` is its bandwidth estimate in kb/s; with none yet it starts on `l`.
-pub(crate) fn pick_layer(
-    current: Option<Layer>,
-    estimate: Option<u64>,
-    quality: Quality,
-    ceiling: Quality,
-) -> Option<Layer> {
-    match quality.min(ceiling) {
-        Quality::Off => None,
-        Quality::Low => Some(Layer::Low),
-        Quality::High => {
-            let Some(estimate) = estimate else {
-                return Some(Layer::Low);
-            };
-            let floor = if current == Some(Layer::High) {
-                DOWN_KBPS
-            } else {
-                UP_KBPS
-            };
-            Some(if estimate >= floor {
-                Layer::High
-            } else {
-                Layer::Low
-            })
+/// What a listener's link has room for beside its audio, lowest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Fit {
+    /// No video at all.
+    Audio,
+    /// `l`.
+    Low,
+    /// `l`, or a share.
+    Share,
+    /// Anything.
+    High,
+}
+
+impl Fit {
+    /// Each step above audio, highest first: the kb/s that reaches it, and what keeps it.
+    const STEPS: [(Self, u64, u64); 3] = [
+        (Self::High, UP_KBPS, DOWN_KBPS),
+        (Self::Share, SHARE_UP_KBPS, SHARE_DOWN_KBPS),
+        (Self::Low, RESUME_KBPS, PAUSE_KBPS),
+    ];
+
+    /// The most `kbps` carries for a listener at `from`.
+    fn of(kbps: u64, from: Self) -> Self {
+        Self::STEPS
+            .iter()
+            .find(|(step, up, down)| kbps >= if from >= *step { *down } else { *up })
+            .map_or(Self::Audio, |(step, _, _)| *step)
+    }
+
+    /// The camera layers this leaves room for.
+    pub fn quality(self) -> Quality {
+        match self {
+            Self::Audio => Quality::Off,
+            Self::Low | Self::Share => Quality::Low,
+            Self::High => Quality::High,
         }
+    }
+}
+
+/// Follows what one listener's link can carry. Down at once, because a full link is losing
+/// audio now; up only once it has held that long, so the video does not flap on a link that
+/// only looks better for a moment.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Link {
+    /// `None` until the first estimate, which is taken as it comes.
+    fit: Option<Fit>,
+    rising: Option<Instant>,
+}
+
+impl Link {
+    /// `spare` is the estimate less the audio this listener gets, in kb/s. Moves up take `hold`.
+    pub fn update(&mut self, spare: Option<u64>, hold: Duration, now: Instant) -> Option<Fit> {
+        let Some(spare) = spare else {
+            return self.fit;
+        };
+        let Some(fit) = self.fit else {
+            self.fit = Some(Fit::of(spare, Fit::High));
+            return self.fit;
+        };
+        let target = Fit::of(spare, fit);
+        if target <= fit {
+            self.fit = Some(target);
+            self.rising = None;
+            return self.fit;
+        }
+        let since = *self.rising.get_or_insert(now);
+        if now.saturating_duration_since(since) >= hold {
+            self.fit = Some(target);
+            self.rising = None;
+        }
+        self.fit
+    }
+}
+
+/// The layer a listener should get. `fit` is what its link has room for; with no estimate yet
+/// it starts on `l`.
+pub(crate) fn pick_layer(fit: Option<Fit>, quality: Quality, ceiling: Quality) -> Option<Layer> {
+    match (quality.min(ceiling), fit) {
+        (Quality::Off, _) | (_, Some(Fit::Audio)) => None,
+        (Quality::High, Some(Fit::High)) => Some(Layer::High),
+        _ => Some(Layer::Low),
     }
 }
 
@@ -277,42 +342,81 @@ mod tests {
         assert_eq!(Layer::Share.other(), Layer::Share);
     }
 
+    const HOLD: Duration = Duration::from_secs(5);
+
     #[test]
-    fn the_layer_follows_the_estimate_with_hysteresis() {
+    fn what_fits_follows_the_room_for_video_with_hysteresis() {
+        assert_eq!(Fit::of(5000, Fit::Audio), Fit::High);
+        assert_eq!(Fit::of(UP_KBPS - 1, Fit::Low), Fit::Share);
+        assert_eq!(Fit::of(UP_KBPS - 1, Fit::High), Fit::High);
+        assert_eq!(Fit::of(DOWN_KBPS, Fit::High), Fit::High);
+        assert_eq!(Fit::of(DOWN_KBPS - 1, Fit::High), Fit::Share);
+        assert_eq!(Fit::of(SHARE_UP_KBPS - 1, Fit::Low), Fit::Low);
+        assert_eq!(Fit::of(SHARE_DOWN_KBPS, Fit::Share), Fit::Share);
+        assert_eq!(Fit::of(SHARE_DOWN_KBPS - 1, Fit::Share), Fit::Low);
+        assert_eq!(Fit::of(RESUME_KBPS - 1, Fit::Audio), Fit::Audio);
+        assert_eq!(Fit::of(RESUME_KBPS, Fit::Audio), Fit::Low);
+        assert_eq!(Fit::of(PAUSE_KBPS, Fit::Low), Fit::Low);
+        assert_eq!(Fit::of(PAUSE_KBPS - 1, Fit::Low), Fit::Audio);
+    }
+
+    #[test]
+    fn a_link_drops_at_once_and_climbs_only_after_the_hold() {
+        let start = Instant::now();
+        let mut link = Link::default();
+        assert_eq!(link.update(None, HOLD, start), None);
+        assert_eq!(link.update(Some(5000), HOLD, start), Some(Fit::High));
+        assert_eq!(link.update(Some(200), HOLD, start), Some(Fit::Audio));
+        assert_eq!(link.update(Some(5000), HOLD, start), Some(Fit::Audio));
+        let almost = start + HOLD - Duration::from_millis(1);
+        assert_eq!(link.update(Some(5000), HOLD, almost), Some(Fit::Audio));
+        assert_eq!(link.update(Some(5000), HOLD, start + HOLD), Some(Fit::High));
+    }
+
+    #[test]
+    fn a_dip_starts_the_hold_over() {
+        let start = Instant::now();
+        let mut link = Link::default();
+        link.update(Some(500), HOLD, start);
+        assert_eq!(link.update(Some(5000), HOLD, start), Some(Fit::Low));
+        let dip = start + HOLD / 2;
+        assert_eq!(link.update(Some(500), HOLD, dip), Some(Fit::Low));
+        assert_eq!(link.update(Some(5000), HOLD, dip), Some(Fit::Low));
+        assert_eq!(link.update(Some(5000), HOLD, start + HOLD), Some(Fit::Low));
+        assert_eq!(link.update(Some(5000), HOLD, dip + HOLD), Some(Fit::High));
+    }
+
+    #[test]
+    fn the_first_estimate_is_taken_as_it_comes() {
+        let mut link = Link::default();
+        // A little audio off the estimator's 1,000 kb/s start must not lose a share.
+        let first = link.update(Some(950), HOLD, Instant::now());
+        assert_eq!(first, Some(Fit::Share));
+    }
+
+    #[test]
+    fn the_layer_follows_what_fits() {
         let high = Quality::High;
-        assert_eq!(pick_layer(None, None, high, high), Some(Layer::Low));
-        assert_eq!(pick_layer(None, Some(500), high, high), Some(Layer::Low));
-        assert_eq!(
-            pick_layer(Some(Layer::Low), Some(1500), high, high),
-            Some(Layer::Low)
-        );
-        assert_eq!(
-            pick_layer(Some(Layer::Low), Some(UP_KBPS), high, high),
-            Some(Layer::High)
-        );
-        assert_eq!(
-            pick_layer(Some(Layer::High), Some(1400), high, high),
-            Some(Layer::High)
-        );
-        assert_eq!(
-            pick_layer(Some(Layer::High), Some(DOWN_KBPS - 1), high, high),
-            Some(Layer::Low)
-        );
+        assert_eq!(pick_layer(None, high, high), Some(Layer::Low));
+        assert_eq!(pick_layer(Some(Fit::Audio), high, high), None);
+        assert_eq!(pick_layer(Some(Fit::Low), high, high), Some(Layer::Low));
+        assert_eq!(pick_layer(Some(Fit::Share), high, high), Some(Layer::Low));
+        assert_eq!(pick_layer(Some(Fit::High), high, high), Some(Layer::High));
     }
 
     #[test]
     fn quality_and_the_budget_cap_the_layer() {
-        let lots = Some(10_000);
+        let lots = Some(Fit::High);
         assert_eq!(
-            pick_layer(None, lots, Quality::Low, Quality::High),
+            pick_layer(lots, Quality::Low, Quality::High),
             Some(Layer::Low)
         );
-        assert_eq!(pick_layer(None, lots, Quality::Off, Quality::High), None);
+        assert_eq!(pick_layer(lots, Quality::Off, Quality::High), None);
         assert_eq!(
-            pick_layer(None, lots, Quality::High, Quality::Low),
+            pick_layer(lots, Quality::High, Quality::Low),
             Some(Layer::Low)
         );
-        assert_eq!(pick_layer(None, lots, Quality::High, Quality::Off), None);
+        assert_eq!(pick_layer(lots, Quality::High, Quality::Off), None);
     }
 
     fn camera(budget: Option<u32>, audio: u64, viewers: u64) -> Quality {

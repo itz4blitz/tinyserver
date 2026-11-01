@@ -118,6 +118,32 @@ async fn a_listener_on_a_slow_link_gets_the_low_layer() {
 }
 
 #[tokio::test]
+async fn a_link_too_small_for_video_pauses_it_and_it_resumes_on_a_keyframe() {
+    let mut sfu = start(config());
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    b.running.remb(Some(1000));
+    sfu.camera(&a, true).await;
+    sfu.video_for(&b.call_id, Some("a")).await;
+    sees(&b, b'A').await;
+
+    b.running.remb(Some(200));
+    sfu.video_for(&b.call_id, None).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let paused = seen_over(&b, Duration::from_millis(500)).await;
+    assert!(paused.is_empty(), "video on a starved link: {paused:?}");
+
+    // Enough to stay on, not to come back.
+    b.running.remb(Some(400));
+    let held = seen_over(&b, Duration::from_millis(1500)).await;
+    assert!(held.is_empty(), "video below the resume point: {held:?}");
+
+    b.running.remb(Some(1000));
+    sfu.video_for(&b.call_id, Some("a")).await;
+    assert!(sees(&b, b'A').await[0].keyframe);
+}
+
+#[tokio::test]
 async fn call_quality_caps_the_layer_or_turns_video_off() {
     let mut sfu = start(config());
     let a = join(&mut sfu, "r", "a", b'A').await;

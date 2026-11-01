@@ -105,6 +105,9 @@ pub struct Config {
     /// starts on `l` and moves up as the estimate climbs. `None` turns the estimator off;
     /// layers then follow only the client's REMB, `call.quality`, and the upload budget.
     pub bwe_start_kbps: Option<u32>,
+    /// How long a listener's link must hold before their video moves up a step. Moves down
+    /// are at once.
+    pub layer_hold: Duration,
     /// Packets one source address may send a second, and the burst above that.
     pub packets_per_second: u32,
     pub packet_burst: u32,
@@ -140,6 +143,7 @@ impl Config {
             share_kbps: 5000,
             egress_kbps: None,
             bwe_start_kbps: Some(1000),
+            layer_hold: Duration::from_secs(5),
             packets_per_second: 2000,
             packet_burst: 4000,
             tcp_streams: 256,
