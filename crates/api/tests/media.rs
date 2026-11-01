@@ -373,6 +373,26 @@ async fn a_killed_client_leaves_with_media_lost() {
     .await;
 }
 
+#[tokio::test]
+async fn an_sfu_that_stops_by_itself_is_a_failure_and_a_shutdown_is_not() {
+    run(|db| async move {
+        let (media, events) = sfu::start(media_config()).expect("start the SFU");
+        let handle = media.clone();
+        let live = Live::with_media(db.runtime.clone(), Limits::default(), media, events);
+        let server = serve_live(&db, live).await;
+        assert!(!server.live.media_failed());
+        handle.shutdown();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !server.live.media_failed() {
+            assert!(Instant::now() < deadline, "the SFU did not stop");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        server.live.close();
+        assert!(!server.live.media_failed());
+    })
+    .await;
+}
+
 /// A blip on the live socket leaves media alone: the same session's next socket gets the seat
 /// and the slot map, and the grace ending does not stop a healthy call.
 #[tokio::test]

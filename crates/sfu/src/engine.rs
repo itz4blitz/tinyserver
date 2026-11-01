@@ -64,6 +64,8 @@ const SOURCES: usize = 4096;
 /// A source silent this long loses its budget entry.
 const SOURCE_IDLE: Duration = Duration::from_secs(10);
 const LOAD_EVERY: Duration = Duration::from_secs(5);
+/// How often the counters are logged while anyone is in a call.
+const REPORT_EVERY: Duration = Duration::from_secs(60);
 /// Seconds of `audio_kbps` a publisher may run ahead of it, for a burst after a stall.
 const AUDIO_BURST: u32 = 2;
 /// Video slots are planned again at least this often.
@@ -439,14 +441,18 @@ pub(crate) struct Engine {
     egress: u64,
     counts: Counts,
     load_at: Instant,
+    reported_at: Instant,
     swept_at: Instant,
     /// The last look at who is speaking and which streams expired.
     scanned_at: Instant,
 }
 
-/// What the media thread dropped or asked for since the last time it reported.
+/// What the media thread dropped or asked for since the last time it reported. Totals only:
+/// nothing here names a person or a call.
 #[derive(Debug, Default)]
 struct Counts {
+    /// The longest turn of the loop, from waking to going back to wait.
+    longest_turn: Duration,
     /// Audio frames over a publisher's budget.
     audio_dropped: u64,
     /// Video frames over a layer's budget, or waiting for a keyframe after one.
@@ -522,6 +528,7 @@ impl Engine {
             egress: 0,
             counts: Counts::default(),
             load_at: now,
+            reported_at: now,
             swept_at: now,
             scanned_at: now,
         };
@@ -551,6 +558,7 @@ impl Engine {
                     return;
                 }
             }
+            let woke = Instant::now();
             if !self.commands() {
                 tracing::info!("media stopped");
                 return;
@@ -580,6 +588,8 @@ impl Engine {
                 self.read_stream(token, Instant::now());
             }
             self.tick(Instant::now());
+            let turn = woke.elapsed();
+            self.counts.longest_turn = self.counts.longest_turn.max(turn);
         }
     }
 
@@ -1334,6 +1344,10 @@ impl Engine {
             self.sources
                 .retain(|_, bucket| now.saturating_duration_since(bucket.used()) < SOURCE_IDLE);
         }
+        if now.saturating_duration_since(self.reported_at) >= REPORT_EVERY {
+            self.reported_at = now;
+            self.report();
+        }
         let since = now.saturating_duration_since(self.load_at);
         if since >= LOAD_EVERY {
             let egress_kbps = self.egress.saturating_mul(8) / since.as_millis().max(1) as u64;
@@ -1344,6 +1358,23 @@ impl Engine {
                 participants: self.peers.len(),
             });
         }
+    }
+
+    /// Logs the counters while anyone is in a call, and starts them over.
+    fn report(&mut self) {
+        let counts = std::mem::take(&mut self.counts);
+        if self.peers.is_empty() {
+            return;
+        }
+        tracing::info!(
+            peers = self.peers.len(),
+            audio_dropped = counts.audio_dropped,
+            send_dropped = counts.send_dropped,
+            video_dropped = counts.video_dropped,
+            keyframe_asks = counts.keyframe_asks,
+            longest_turn_ms = counts.longest_turn.as_millis() as u64,
+            "media counters"
+        );
     }
 
     /// Closes TCP streams that failed, never verified in time, or went quiet.

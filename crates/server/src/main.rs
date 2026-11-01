@@ -432,8 +432,10 @@ async fn serve() -> anyhow::Result<()> {
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(%bind, "listening");
     let sweeper = tokio::spawn(sweep_every(pool, SWEEP_EVERY));
+    let watcher = tokio::spawn(exit_if_media_fails(live.clone()));
     let served = axum_serve(listener, app, live.clone()).await;
     sweeper.abort();
+    watcher.abort();
     live.close();
     if !live.closed(DRAIN).await {
         tracing::warn!(sockets = live.sockets(), "live sockets still open at exit");
@@ -717,6 +719,8 @@ fn media_config(room_max: usize) -> anyhow::Result<Option<sfu::Config>> {
 
 const DEFAULT_MEDIA_PORT: u16 = 50000;
 
+/// How often the process checks that the SFU's thread is alive.
+const MEDIA_CHECK_EVERY: Duration = Duration::from_secs(1);
 /// How long live sockets get to take their close frame on shutdown.
 const DRAIN: Duration = Duration::from_secs(5);
 
@@ -742,6 +746,19 @@ async fn sweep_every(pool: PgPool, period: Duration) {
             ),
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "sweep failed"),
+        }
+    }
+}
+
+/// Ends the process once the SFU has stopped by itself. `/health` would say 503 and every
+/// call would stay down until someone noticed; the container's restart policy brings it back.
+async fn exit_if_media_fails(live: api::Live) {
+    let mut ticks = tokio::time::interval(MEDIA_CHECK_EVERY);
+    loop {
+        ticks.tick().await;
+        if live.media_failed() {
+            tracing::error!("media stopped by itself; exiting");
+            std::process::exit(1);
         }
     }
 }

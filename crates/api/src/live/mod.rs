@@ -120,6 +120,11 @@ impl Live {
         self.hub.media_status()
     }
 
+    /// The SFU stopped by itself. Calls cannot start again until the process does.
+    pub fn media_failed(&self) -> bool {
+        self.hub.media_failed()
+    }
+
     /// The media transports up now. Empty without an SFU or once it stopped.
     pub fn transports(&self) -> Vec<&'static str> {
         self.hub

@@ -195,6 +195,11 @@ impl Hub {
         }
     }
 
+    /// The SFU stopped with nobody asking it to: a poll failed or its thread panicked.
+    pub fn media_failed(&self) -> bool {
+        !self.closing() && self.media_status() == "down"
+    }
+
     /// Do not establish a socket cursor before the dispatcher has its starting cursor.
     pub async fn ready(&self) {
         let _ = self.ready.subscribe().wait_for(|ready| *ready).await;

@@ -358,7 +358,7 @@ As built, behind `sfu::Media` (a cloneable handle) and `sfu::Event`:
 | `quality(call_id, Quality)` | `High`, `Low`, or `Off`, from `call.quality` | | |
 | `end_share(call_id)` | From `call.share_end`. Stops forwarding the share until the m-line stops and starts again. | | |
 | `leave(call_id)` | Drops the participant. No `Left` follows. | `Left {call_id, lost}` | `Timeout`: not connected within 15 s of the SFU accepting the join. `Gone`: no packet for 30 s, or the RTC closed, died, or failed a poll. |
-| `shutdown()` | Graceful stop | `Load {egress_kbps, participants}` | Every 5 s. Logged at debug. |
+| `shutdown()` | Graceful stop | `Load {egress_kbps, participants}` | Every 5 s. Logged at debug. Once a minute while anyone is in a call, the media thread also logs one `media counters` line at info: `peers`, `audio_dropped`, `send_dropped`, `video_dropped`, `keyframe_asks`, `longest_turn_ms`. Totals only, with no identifiers. |
 
 There is no `EndRoom`: a deleted room ends each person's seat, and each one sends `leave`. Commands go through a bounded `std::sync::mpsc` channel of 1,024 with `try_send`, and wake the loop with the `Waker`; a full queue refuses a join with `media_unavailable`. Events go back through a bounded `tokio::sync::mpsc` channel of 1,024. `Speaking` and `Load` use `try_send` and are dropped when it is full; the rest wait for room.
 
@@ -441,7 +441,7 @@ Calls live in memory and end on restart. That is the trade for keeping RTP out o
 | Client | Reconnects `/v1/live` with backoff (0.5 s, 1, 2, 4, cap 10). If it was in a call and the user did not hang up, `mediad` sends a fresh `call.join` to the same room. Target: back in the call within 5 s of the server answering. |
 | Durable events | Replayed from `since`. Nothing is lost. |
 
-The SFU task ending does not empty the call registry and does not emit `call.left`. `GET /health` can report media `down` while seats remain. Further joins with an offer get `media_unavailable`. A join without an offer is `bad_frame` while the SFU handle still exists. Sockets stay up. People leave by `call.leave`, by the socket grace, or by a later moderation or membership event.
+The SFU thread stopping by itself, on a panic or a failed poll, ends the process within a second, and the container's restart policy starts it again, so sockets close and every call ends. Until then the call registry stays as it was, `GET /health` reports media `down`, and joins with an offer get `media_unavailable`. A shutdown the server asked for is not that: `Live::close` empties the registry first.
 
 ## End-to-end encryption
 
