@@ -1711,8 +1711,28 @@ impl Engine {
         }
     }
 
+    /// `id` waits for a layer its publisher is not sending, while the other one flows: a
+    /// publisher without simulcast, say. Only a better fit can show them anything. Waiting for
+    /// the keyframe of a layer that flows, or for a first frame, is not this: the estimate says
+    /// nothing yet then, and taking it would throw away a fit that was measured.
+    fn stuck(&self, id: PeerId, now: Instant) -> bool {
+        let wanted = self
+            .peers
+            .get(&id)
+            .and_then(|peer| peer.screen.as_ref())
+            .and_then(|screen| screen.wanted.filter(|_| screen.wanted != screen.showing));
+        let Some((publisher, layer)) = wanted else {
+            return false;
+        };
+        self.peers.get(&publisher).is_some_and(|publisher| {
+            let fresh = |layer: Layer| publisher.layers[layer.index()].fresh(now);
+            !fresh(layer) && fresh(layer.other())
+        })
+    }
+
     fn plan_screen(&mut self, id: PeerId, ceiling: Ceiling, now: Instant) {
         let hold = self.config.layer_hold;
+        let stuck = self.stuck(id, now);
         let Some(peer) = self.peers.get_mut(&id) else {
             return;
         };
@@ -1723,8 +1743,10 @@ impl Engine {
         // With no video going out the estimator has nothing to measure, and sinks to about what
         // it was last told to probe for. That says nothing about the link, unless this listener
         // was held back: then str0m pads the stream to find out, and the estimate is the way back.
-        let measured =
-            screen.showing.is_some() || screen.link.paused() || screen.share_gate.refused();
+        let measured = screen.showing.is_some()
+            || screen.link.paused()
+            || screen.share_gate.refused()
+            || stuck;
         let fit = screen.link.update(spare.filter(|_| measured), hold, now);
         let showing_share = screen
             .showing
@@ -2215,15 +2237,6 @@ mod tests {
         assert!(outbox.waiting.is_empty());
     }
 
-    #[test]
-    fn events_for_a_gone_api_are_let_go() {
-        let (sender, receiver) = async_mpsc::channel(1);
-        let mut outbox = Outbox::new(sender);
-        drop(receiver);
-        outbox.tell(left("a"));
-        assert!(outbox.waiting.is_empty());
-    }
-
     fn slots(call_id: &str, mid: &str) -> Event {
         Event::Slots {
             call_id: call_id.to_string(),
@@ -2263,6 +2276,15 @@ mod tests {
                 left("a")
             ]
         );
+    }
+
+    #[test]
+    fn events_for_a_gone_api_are_let_go() {
+        let (sender, receiver) = async_mpsc::channel(1);
+        let mut outbox = Outbox::new(sender);
+        drop(receiver);
+        outbox.tell(left("a"));
+        assert!(outbox.waiting.is_empty());
     }
 
     #[test]

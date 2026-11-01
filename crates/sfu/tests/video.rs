@@ -143,6 +143,29 @@ async fn a_link_too_small_for_video_pauses_it_and_it_resumes_on_a_keyframe() {
     assert!(sees(&b, b'A').await[0].keyframe);
 }
 
+/// A publisher with no `l`, and a listener whose link last had room for `l`. Nothing can show
+/// until the link is measured again, so it has to be, or the slot stays empty for good.
+#[tokio::test]
+async fn a_listener_held_on_l_finds_its_way_to_a_publisher_with_only_h() {
+    let mut sfu = start(config());
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    a.running.single_layer();
+    sfu.camera(&a, true).await;
+    settles_on(&b, b'A', b'h').await;
+
+    b.running.remb(Some(600));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    sfu.camera(&a, false).await;
+    sfu.video_for(&b.call_id, None).await;
+    b.running.remb(Some(5000));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    b.running.take_video();
+
+    sfu.camera(&a, true).await;
+    settles_on(&b, b'A', b'h').await;
+}
+
 #[tokio::test]
 async fn call_quality_caps_the_layer_or_turns_video_off() {
     let mut sfu = start(config());

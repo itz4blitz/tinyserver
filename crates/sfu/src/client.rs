@@ -354,7 +354,12 @@ impl Client {
                         ..Camera::default()
                     };
                 }
-                self.send_video(marker, &mut camera, now);
+                let layers = if shared.single_layer.load(Ordering::Acquire) {
+                    &LAYERS[..1]
+                } else {
+                    &LAYERS[..]
+                };
+                self.send_video(marker, &mut camera, layers, now);
                 next_video += VIDEO_FRAME;
                 continue;
             }
@@ -628,10 +633,10 @@ impl Client {
     }
 
     /// One frame on each layer, with the same RTP time, as a simulcast encoder sends them.
-    fn send_video(&mut self, marker: u8, camera: &mut Camera, now: Instant) {
+    fn send_video(&mut self, marker: u8, camera: &mut Camera, layers: &[Layer], now: Instant) {
         let time = MediaTime::new(camera.sent * TICKS_PER_VIDEO_FRAME, Frequency::NINETY_KHZ);
         camera.sent += 1;
-        for (at, layer) in LAYERS.iter().enumerate() {
+        for (at, layer) in layers.iter().enumerate() {
             let frames = &camera.clips[at];
             if camera.restart[at] {
                 camera.restart[at] = false;
@@ -851,6 +856,8 @@ struct Shared {
     keyframes_asked: AtomicU64,
     share_keyframes_asked: AtomicU64,
     share_kbps: AtomicU64,
+    /// The camera sends `h` alone, as a publisher without simulcast does.
+    single_layer: AtomicBool,
     frames: Mutex<Vec<Frame>>,
     video: Mutex<Vec<VideoFrame>>,
     /// Sent as every audio frame in place of the marker frame, while set.
@@ -869,6 +876,7 @@ impl Default for Shared {
             keyframes_asked: AtomicU64::default(),
             share_keyframes_asked: AtomicU64::default(),
             share_kbps: AtomicU64::new(SHARE_KBPS),
+            single_layer: AtomicBool::default(),
             frames: Mutex::default(),
             video: Mutex::default(),
             sealed: Mutex::default(),
@@ -946,6 +954,11 @@ impl Running {
     /// Pads share frames to `kbps` from the next one on. It starts at 2,500.
     pub fn share_kbps(&self, kbps: u64) {
         self.shared.share_kbps.store(kbps, Ordering::Release);
+    }
+
+    /// Sends `h` alone from the next frame on, as a publisher without simulcast does.
+    pub fn single_layer(&self) {
+        self.shared.single_layer.store(true, Ordering::Release);
     }
 
     /// Undoes the last [`Running::camera`] or [`Running::share`] offer, which the SFU refused,
