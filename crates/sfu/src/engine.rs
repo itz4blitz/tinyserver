@@ -2035,11 +2035,16 @@ pub(crate) fn candidates(
         .collect()
 }
 
-/// The payload type of an RTP packet, whose header SRTP leaves in the clear. RTCP reads as a
-/// number below the dynamic range, so it never matches a media type. RFC 7983 says which is RTP.
+/// The payload type of an RTP packet that carries media, from the header SRTP leaves in the
+/// clear. RTCP reads as a number below the dynamic range, so it never matches a media type. RFC
+/// 7983 says which is RTP. str0m's probe padding comes on the first m-line it may send on, the
+/// audio one's type included, with no real payload behind it: its padding bit tells it apart,
+/// which str0m sets on no media packet.
 fn payload_type(packet: &[u8]) -> Option<Pt> {
     match packet {
-        [128..=191, marker_and_type, ..] => Some((marker_and_type & 0x7f).into()),
+        [first @ 128..=191, marker_and_type, ..] if first & 0x20 == 0 => {
+            Some((marker_and_type & 0x7f).into())
+        }
         _ => None,
     }
 }
@@ -2164,6 +2169,9 @@ mod tests {
         assert_eq!(payload_type(&[22, 254, 253]), None);
         assert_eq!(payload_type(&[0, 1, 0, 0]), None);
         assert_eq!(payload_type(&[0x80]), None);
+        // str0m's probe padding, its padding bit set, on the audio m-line's payload type.
+        assert_eq!(payload_type(&[0xa0, 111, 0, 1]), None);
+        assert_eq!(payload_type(&[0xb0, 0x80 | 111, 0, 1]), None);
     }
 
     fn left(call_id: &str) -> Event {
