@@ -373,6 +373,58 @@ async fn a_killed_client_leaves_with_media_lost() {
     .await;
 }
 
+/// A blip on the live socket leaves media alone: the same session's next socket gets the seat
+/// and the slot map, and the grace ending does not stop a healthy call.
+#[tokio::test]
+async fn a_blip_on_the_live_socket_leaves_media_up() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let limits = Limits {
+            presence_grace: Duration::from_millis(500),
+            ..Limits::default()
+        };
+        let (media, events) = sfu::start(media_config()).expect("start the SFU");
+        let live = Live::with_media(db.runtime.clone(), limits, media, events);
+        let server = serve_live(&db, live).await;
+        let (ws, _) = connect(&server, &cast.owner.1, None).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        let (ws, _) = connect(&server, &cast.members[0].1, None).await;
+        let b = dial(ws, &cast.members[0].0, &cast.lobby, b'B').await;
+        let a_slots = slots(&mut a.ws, &a.call_id, 1).await;
+        b.running.sending(true);
+        hears(&a, &mid_for(&a_slots, &b.user_id), b'B').await;
+
+        let Person {
+            ws,
+            user_id,
+            call_id,
+            running,
+        } = a;
+        drop(ws);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (ws, ready) = connect(&server, &cast.owner.1, None).await;
+        assert_eq!(ready["calls"][0]["room_id"], cast.lobby.as_str());
+        let mut a = Person {
+            ws,
+            user_id,
+            call_id,
+            running,
+        };
+        // What it may have missed while away, with no `call.join`.
+        assert_eq!(slots(&mut a.ws, &a.call_id, 1).await, a_slots);
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        hears(&a, &mid_for(&a_slots, &b.user_id), b'B').await;
+        let (_, ready) = connect(&server, &cast.members[1].1, None).await;
+        assert_eq!(
+            ready["calls"][0]["participants"].as_array().map(Vec::len),
+            Some(2),
+            "{ready}"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn mute_is_shown_to_everyone_and_stops_forwarding() {
     run(|db| async move {

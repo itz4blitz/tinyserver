@@ -1,9 +1,23 @@
 //! Who is in which room's call. Memory only; a restart ends every call.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::time::{Duration, Instant};
+
+/// One signed-in device: a digest of its session token. A person's phone and desktop differ,
+/// and the same device stays the same across sockets.
+pub(crate) type Session = [u8; 32];
+
+pub(crate) fn session_of(token: &str) -> Session {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// `call.e2ee` frames kept for a seat whose socket closed, to hand to the next one. Commits are
+/// few in a grace; `call.join` and `call.leave` are limited per socket.
+const HELD: usize = 32;
 
 /// Why someone left a call. Sent as `call.left` `reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,11 +149,24 @@ pub(crate) struct Moderation {
     pub hushed: bool,
 }
 
+/// What a device gets back with its seat.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Regained {
+    pub call_id: Option<String>,
+    /// `call.e2ee` frames that came while no socket held the seat, in order.
+    pub frames: Vec<Arc<str>>,
+}
+
 /// Where a person sits. `conn` is the socket that joined; `None` once it closed.
 struct Seat {
     room_id: String,
     conn: Option<u64>,
     epoch: u64,
+    /// The device that joined. `None` until `set_session`.
+    session: Option<Session>,
+    /// `call.e2ee` frames for the next socket. A member who misses a commit cannot follow the
+    /// group, so these are not dropped as other frames for a closed socket are.
+    held: Vec<Arc<str>>,
     /// Their SFU participant. `None` for a join without media.
     call_id: Option<String>,
     muted: bool,
@@ -240,6 +267,7 @@ impl Calls {
                 seat.conn = Some(conn);
                 seat.call_id = call_id;
                 seat.access = access;
+                seat.held.clear();
                 if seat.e2ee != e2ee {
                     seat.e2ee = e2ee;
                     return Ok(vec![self.state(user_id)]);
@@ -261,6 +289,8 @@ impl Calls {
                 room_id: room_id.to_string(),
                 conn: Some(conn),
                 epoch: self.epoch,
+                session: None,
+                held: Vec::new(),
                 call_id,
                 muted: false,
                 deafened: false,
@@ -468,6 +498,44 @@ impl Calls {
         Some(seat.epoch)
     }
 
+    /// Records which device holds `user_id`'s seat.
+    pub fn set_session(&mut self, user_id: &str, session: Session) {
+        if let Some(seat) = self.seats.get_mut(user_id) {
+            seat.session = Some(session);
+        }
+    }
+
+    /// A new socket `conn` opened for `session`. If that device holds `user_id`'s seat, the seat
+    /// moves to it, so a blip on the live socket leaves healthy media alone. A socket that has
+    /// not closed yet loses it too: a half-open one can take a minute to notice, and a device
+    /// has one live socket. Any other device of theirs takes the seat only with `call.join`.
+    pub fn regain(&mut self, user_id: &str, session: Session, conn: u64) -> Option<Regained> {
+        let seat = self.seats.get_mut(user_id)?;
+        if seat.session != Some(session) {
+            return None;
+        }
+        seat.conn = Some(conn);
+        Some(Regained {
+            call_id: seat.call_id.clone(),
+            frames: std::mem::take(&mut seat.held),
+        })
+    }
+
+    /// Keeps `frame` if no socket holds `user_id`'s seat. False if one does, or they have none.
+    pub fn hold(&mut self, user_id: &str, frame: &Arc<str>) -> bool {
+        let Some(seat) = self
+            .seats
+            .get_mut(user_id)
+            .filter(|seat| seat.conn.is_none())
+        else {
+            return false;
+        };
+        if seat.held.len() < HELD {
+            seat.held.push(Arc::clone(frame));
+        }
+        true
+    }
+
     /// Leaves if the seat is still the one `orphan` left, with no socket rejoined since.
     pub fn expire(&mut self, user_id: &str, epoch: u64) -> Option<Change> {
         let seat = self.seats.get(user_id)?;
@@ -568,6 +636,8 @@ impl Moves {
 #[cfg(test)]
 mod tests {
     use super::{Access, Calls, Change, Moderation, Moves, Participant, Reason, Refused};
+    use super::{Regained, HELD};
+    use std::sync::Arc;
     use std::time::Duration;
 
     const FREE: Access = Access {
@@ -623,6 +693,63 @@ mod tests {
         );
         assert_eq!(calls.room_of("u"), Some("b"));
         assert_eq!(calls.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn the_same_session_regains_a_seat_and_stops_its_expiry() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        let epoch = calls.orphan("u", 1).expect("seat held by 1");
+        assert_eq!(calls.regain("u", [2; 32], 2), None, "another device");
+        assert_eq!(calls.conn_of("u"), None);
+        assert_eq!(
+            calls.regain("u", [1; 32], 3),
+            Some(Regained {
+                call_id: None,
+                frames: Vec::new()
+            })
+        );
+        assert_eq!(calls.conn_of("u"), Some(3));
+        assert_eq!(calls.expire("u", epoch), None);
+        assert_eq!(calls.room_of("u"), Some("a"));
+    }
+
+    #[test]
+    fn a_seat_with_no_session_is_not_regained() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        assert_eq!(calls.regain("u", [1; 32], 2), None);
+        assert_eq!(calls.conn_of("u"), Some(1));
+    }
+
+    #[test]
+    fn frames_for_a_closed_socket_wait_for_the_next_one_up_to_a_cap() {
+        let mut calls = Calls::default();
+        let frame: Arc<str> = Arc::from("frame");
+        assert!(!calls.hold("u", &frame), "no seat");
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        assert!(!calls.hold("u", &frame), "the socket is up");
+        calls.orphan("u", 1);
+        for _ in 0..HELD + 1 {
+            assert!(calls.hold("u", &frame));
+        }
+        let regained = calls.regain("u", [1; 32], 2).expect("the same device");
+        assert_eq!(regained.frames.len(), HELD);
+        assert!(!calls.hold("u", &frame), "the socket is back");
+    }
+
+    #[test]
+    fn a_join_drops_what_was_held_for_the_old_media() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        calls.orphan("u", 1);
+        assert!(calls.hold("u", &Arc::from("frame")));
+        assert!(join(&mut calls, "u", "a", 2).is_ok());
+        let regained = calls.regain("u", [1; 32], 3).expect("the same device");
+        assert!(regained.frames.is_empty());
     }
 
     #[test]

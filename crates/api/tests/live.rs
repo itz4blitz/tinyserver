@@ -710,6 +710,114 @@ async fn a_dropped_socket_leaves_its_call_after_the_grace() {
 }
 
 #[tokio::test]
+async fn the_same_session_back_on_a_new_socket_keeps_its_seat() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let lobby = room(&db, &owner, "Lobby").await;
+        let limits = Limits {
+            presence_grace: Duration::from_millis(300),
+            ..Limits::default()
+        };
+        let server = serve(&db, limits).await;
+        let token = owner_token(&db).await;
+        let (mut owner_ws, _) = connect(&server, &token, None).await;
+        let (mut member_ws, _) = connect(&server, &member_token, None).await;
+        enter(&mut member_ws, &lobby.id, &member.user_id).await;
+        assert_eq!(
+            durable(&mut owner_ws).await,
+            joined(&lobby.id, &member.user_id)
+        );
+
+        // The socket drops and comes back within the grace. Nothing joins again.
+        drop(member_ws);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_member_ws, ready) = connect(&server, &member_token, None).await;
+        assert_eq!(
+            ready["calls"],
+            json!([occupancy(&lobby.id, &[&member.user_id])])
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        ping(&mut owner_ws).await;
+        let (_, ready) = connect(&server, &token, None).await;
+        assert_eq!(
+            ready["calls"],
+            json!([occupancy(&lobby.id, &[&member.user_id])])
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_same_session_takes_its_seat_from_a_socket_not_yet_closed() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let lobby = room(&db, &owner, "Lobby").await;
+        let limits = Limits {
+            presence_grace: Duration::from_millis(200),
+            ..Limits::default()
+        };
+        let server = serve(&db, limits).await;
+        let token = owner_token(&db).await;
+        let (mut owner_ws, _) = connect(&server, &token, None).await;
+        let (mut old_ws, _) = connect(&server, &member_token, None).await;
+        enter(&mut old_ws, &lobby.id, &member.user_id).await;
+        assert_eq!(
+            durable(&mut owner_ws).await,
+            joined(&lobby.id, &member.user_id)
+        );
+
+        // A half-open socket: the client has moved on before the server notices.
+        let (_new_ws, _) = connect(&server, &member_token, None).await;
+        drop(old_ws);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        ping(&mut owner_ws).await;
+        let (_, ready) = connect(&server, &token, None).await;
+        assert_eq!(
+            ready["calls"],
+            json!([occupancy(&lobby.id, &[&member.user_id])])
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn another_device_of_the_same_person_does_not_take_the_seat() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let other_device = db::open_session(&db.runtime, &member.user_id)
+            .await
+            .expect("a second session")
+            .token;
+        let lobby = room(&db, &owner, "Lobby").await;
+        let limits = Limits {
+            presence_grace: Duration::from_millis(300),
+            ..Limits::default()
+        };
+        let server = serve(&db, limits).await;
+        let token = owner_token(&db).await;
+        let (mut owner_ws, _) = connect(&server, &token, None).await;
+        let (mut member_ws, _) = connect(&server, &member_token, None).await;
+        enter(&mut member_ws, &lobby.id, &member.user_id).await;
+        assert_eq!(
+            durable(&mut owner_ws).await,
+            joined(&lobby.id, &member.user_id)
+        );
+
+        drop(member_ws);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (_phone, _) = connect(&server, &other_device, None).await;
+        assert_eq!(
+            durable(&mut owner_ws).await,
+            left(&lobby.id, &member.user_id, "disconnected")
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn caps_refuse_a_full_room_and_a_full_server() {
     run(|db| async move {
         let owner = first_owner(&db).await;

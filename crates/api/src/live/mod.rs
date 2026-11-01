@@ -178,6 +178,7 @@ async fn upgrade(
             };
             socket::Me {
                 token: token.to_string(),
+                session: call::session_of(token),
                 user_id: identity.user_id,
                 role: identity.role,
                 permissions: identity.permissions,
@@ -191,6 +192,7 @@ async fn upgrade(
             };
             socket::Me {
                 token: token.to_string(),
+                session: call::session_of(token),
                 user_id: bot.id,
                 role: "bot".to_string(),
                 permissions: 0,

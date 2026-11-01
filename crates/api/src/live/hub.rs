@@ -11,7 +11,7 @@ use sqlx::postgres::PgListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
-use super::call::{Access, Calls, Change, Moderation, Occupancy, Reason, Refused};
+use super::call::{Access, Calls, Change, Moderation, Occupancy, Reason, Refused, Session};
 use super::e2ee;
 use super::frame::{Event, Out, SlotFrame, VideoSlotFrame};
 use super::socket::Close;
@@ -82,10 +82,14 @@ impl People {
         }
     }
 
-    /// Sends `call.e2ee` frames, each to the socket holding its person's seat.
-    fn e2ee(&self, frames: Vec<e2ee::Outgoing>) {
+    /// Sends `call.e2ee` frames, each to the socket holding its person's seat, or keeps them
+    /// for the next one while that seat has none.
+    fn e2ee(&mut self, frames: Vec<e2ee::Outgoing>) {
         for outgoing in frames {
-            self.to_seat(&outgoing.user_id, Arc::from(outgoing.frame));
+            let frame: Arc<str> = Arc::from(outgoing.frame);
+            if !self.calls.hold(&outgoing.user_id, &frame) {
+                self.to_seat(&outgoing.user_id, frame);
+            }
         }
     }
 }
@@ -233,8 +237,9 @@ impl Hub {
     }
 
     /// Adds a socket for `user_id`. The first one brings the person online. Past the per-user
-    /// cap, the oldest socket is told to close.
-    pub fn join(&self, user_id: &str, bot: bool) -> Joined {
+    /// cap, the oldest socket is told to close. If `session` holds their seat, the seat moves
+    /// here, and what the socket reads after `ready` catches it up.
+    pub fn join(&self, user_id: &str, bot: bool, session: Session) -> Joined {
         let (kick, kicked) = oneshot::channel();
         let (direct, inbox) = mpsc::channel(DIRECT);
         let mut people = lock(&self.people);
@@ -254,6 +259,15 @@ impl Hub {
         });
         if arrived && !bot {
             self.announce(user_id, true);
+        }
+        if let Some(regained) = people.calls.regain(user_id, session, conn) {
+            tracing::info!(conn, "call seat regained");
+            let slots = regained
+                .call_id
+                .and_then(|call_id| people.slots.get(&call_id).cloned());
+            for frame in slots.into_iter().chain(regained.frames) {
+                people.direct(user_id, conn, frame);
+            }
         }
         // Subscribed under the lock, so every presence frame after this snapshot reaches it.
         let presence = self.ephemeral.subscribe();
@@ -347,6 +361,7 @@ impl Hub {
         user_limit: i32,
         access: Access,
         e2ee: bool,
+        session: Session,
     ) -> Result<(), Refused> {
         let call_id = answer.map(|answer| answer.call_id.as_str());
         let mut people = lock(&self.people);
@@ -365,6 +380,7 @@ impl Hub {
             access,
             e2ee,
         )?;
+        people.calls.set_session(user_id, session);
         self.tell(&mut people, changes);
         // A seat with media is in the room's group, or is why the room has none. Taking the
         // same seat again with new media is a leave and a join: the old keys went with it.

@@ -159,7 +159,7 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `ping` | none | Keepalive |
 | `call.join` | `ref`, `room_id`, `sdp`, `e2ee` | Join the room's call. Leaves any other call first. `sdp` is the offer. With an SFU configured it is required (`bad_frame` without it). With no SFU, a join with it gets `media_unavailable` and a join without it takes a seat with no audio. If the handle is present but the SFU task has stopped, an offer is `media_unavailable`. `e2ee` is optional: the highest end-to-end encryption version the app speaks, `1` today. |
 | `call.e2ee` | `op`, and the op's fields | MLS for the caller's call: `key_package`, `commit`, `invalid`. No `ok`: the frames that follow answer it. See [End-to-end encryption](#end-to-end-encryption). |
-| `call.leave` | `ref` | Hang up. Not being in a call is not an error. Closing the socket that joined does the same after a 10 s grace. |
+| `call.leave` | `ref` | Hang up. Not being in a call is not an error. Closing the socket that joined does the same after a 10 s grace, unless the same session opens a new socket first. |
 | `call.kick` | `ref`, `room_id`, `user_id` | disconnect_members in that room, and a rank above the person. Removes them from that room's call. Audited. |
 | `call.share_end` | `ref`, `room_id` | disconnect_members in that room, and a rank above the sharer. An owner skips the rank check and can end their own share. A member cannot; they stop theirs with `call.offer`. Ends the screen share in that room's call. Audited as `call.share_end`. The sharer's m-line keeps sending until they renegotiate; the SFU drops it, and the share stays ended until an offer sets that m-line `inactive` and a later one starts it again. |
 | `call.offer` | `ref`, `sdp` | Renegotiate the caller's media session, for example to start a camera or a share. The reply is `call.answer`. A camera or share that started or stopped is shown to everyone as `call.state`. A share someone else in the room holds is `share_taken`. Counts against the join and leave rate, so a client sending them fast gets `slow_down`. |
@@ -196,7 +196,7 @@ Error codes:
 | --- | --- |
 | `left` | `call.leave` |
 | `joined_elsewhere` | The same person joined another room |
-| `disconnected` | The socket that joined closed and none of the person's sockets joined again within 10 s |
+| `disconnected` | The socket holding the seat closed, the same session opened no new socket, and none of the person's sockets joined again within 10 s |
 | `room_deleted` | The room was deleted |
 | `removed` | The person was removed from the community |
 | `session_ended` | The socket that joined closed with `4001 session_ended` |
@@ -388,7 +388,8 @@ The API decides. The SFU trusts a join that reaches it. On `call.join`:
 | --- | --- |
 | One call per person | A seat belongs to the person, not the socket. Any of their sockets may leave it. |
 | The socket that joined | Holds the seat. A later `call.join` to the same room from another of their sockets takes the seat over without a frame. |
-| That socket closes | The person leaves with `disconnected` after the presence grace (10 s), unless one of their sockets joins again first. A close with `4003` or `4001` leaves at once with `removed` or `session_ended`. |
+| That socket closes | The person leaves with `disconnected` after the presence grace (10 s), unless the same session opens a new socket or one of their sockets joins again first. A close with `4003` or `4001` leaves at once with `removed` or `session_ended`. |
+| The same session opens a new socket | The seat moves to it with no `call.join`, the old socket closed or not, so a blip on the live socket does not touch media. It keeps its SFU participant. Nobody is told; `ready` lists the person in the call, and that socket then gets the latest `call.slots` and any `call.e2ee` frames that came while no socket held the seat. Another device of the same person does not take the seat this way, only with `call.join`. A seat whose app really died now lasts until the SFU's consent timeout rather than the grace, unless a `call.join` replaces it. |
 | Room deleted | The dispatcher sees `room.deleted` and ends the room's call with `room_deleted`. |
 | Member removed | The dispatcher sees `member.removed` and ends their call with `removed`, even if the socket that joined had already gone. |
 | Kick | `call.kick` re-reads the caller's session. The target must be in that room's call. disconnect_members in the room and the hierarchy are checked in Postgres with the `call.kick` audit row (`subject` `call`, `subject_user_id`, `detail {room_id, user_id}`) in one transaction, then the person leaves with `kicked`. |

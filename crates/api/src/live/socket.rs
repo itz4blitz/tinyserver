@@ -9,7 +9,7 @@ use db::{Caller, CommunityError, SessionError};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::call::{Moves, Reason, Refused};
+use super::call::{Moves, Reason, Refused, Session};
 use super::frame::{Audience, Event, Incoming, Me as MeFrame, Out};
 use super::hub::{access, Hub, Joined, Slot};
 
@@ -62,6 +62,8 @@ type Step = Result<(), End>;
 
 pub(crate) struct Me {
     pub token: String,
+    /// The signed-in device this socket belongs to.
+    pub session: Session,
     pub user_id: String,
     pub role: String,
     /// Server-wide permissions, re-read with the session.
@@ -173,7 +175,7 @@ pub(crate) async fn run(
     mut me: Me,
     since: Option<i64>,
 ) {
-    let joined = hub.join(&me.user_id, me.is_bot());
+    let joined = hub.join(&me.user_id, me.is_bot(), me.session);
     let conn = joined.conn;
     tracing::info!(user_id = %me.user_id, conn, "live socket opened");
     if !me.is_bot() {
@@ -658,6 +660,7 @@ async fn call_join(
         found.user_limit,
         access(found.permissions),
         e2ee && answer.is_some(),
+        me.session,
     );
     if let Err(refused) = joined {
         if let Some(answer) = &answer {
@@ -997,6 +1000,7 @@ mod tests {
 
     fn bot(scopes: &[&str]) -> super::Me {
         super::Me {
+            session: [0; 32],
             token: String::new(),
             user_id: "b".to_string(),
             role: "bot".to_string(),
@@ -1029,6 +1033,7 @@ mod tests {
         assert!(!unknown.sees_ephemeral(r#"{"type":"future.secret"}"#));
 
         let person = super::Me {
+            session: [0; 32],
             token: String::new(),
             user_id: "u".to_string(),
             role: "member".to_string(),
