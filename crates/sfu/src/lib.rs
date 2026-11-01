@@ -84,7 +84,8 @@ pub struct Config {
     /// A participant whose ICE and DTLS are not up by then is dropped.
     pub connect_timeout: Duration,
     /// A connected participant silent for this long is dropped. No packet at all, not even
-    /// a STUN consent check.
+    /// a STUN consent check. A client's own ICE gives up in 4 to 7 s and it joins again with a
+    /// fresh offer, so this only clears away what is really gone.
     pub consent_timeout: Duration,
     /// Audio a publisher may send, in kb/s of payload, with a burst of two seconds of it.
     /// Frames over it are not forwarded. Clients encode at the room's bitrate, up to 128 kb/s;
@@ -136,7 +137,7 @@ impl Config {
             public_ip,
             lan_ip: None,
             connect_timeout: Duration::from_secs(15),
-            consent_timeout: Duration::from_secs(30),
+            consent_timeout: Duration::from_secs(15),
             audio_kbps: 192,
             camera_high_kbps: 2400,
             camera_low_kbps: 700,

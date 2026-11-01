@@ -205,7 +205,7 @@ Error codes:
 | `banned` | They were banned |
 | `timed_out` | A timeout started |
 | `media_timeout` | The SFU participant was not connected within 15 s of the SFU accepting the join (`sfu::Config::connect_timeout`). That is slightly before `call.answer` is written. |
-| `media_lost` | After connect, the SFU heard nothing for 30 s (`sfu::Config::consent_timeout`), or the RTC closed, died, or failed a poll. |
+| `media_lost` | After connect, the SFU heard nothing for 15 s (`sfu::Config::consent_timeout`), or the RTC closed, died, or failed a poll. |
 
 ```json
 {"type":"ready","seq":41,"me":{"user_id":"9d1e…","role":"member"},"online":["5a0c…","9d1e…"],"calls":[]}
@@ -357,7 +357,7 @@ As built, behind `sfu::Media` (a cloneable handle) and `sfu::Event`:
 | `moderate(call_id, silenced, hushed)` | Moderation: a `silenced` publisher's audio is not forwarded (server mute, or no speak), a `hushed` listener is sent no audio (server deafen). Video is untouched. | | |
 | `quality(call_id, Quality)` | `High`, `Low`, or `Off`, from `call.quality` | | |
 | `end_share(call_id)` | From `call.share_end`. Stops forwarding the share until the m-line stops and starts again. | | |
-| `leave(call_id)` | Drops the participant. No `Left` follows. | `Left {call_id, lost}` | `Timeout`: not connected within 15 s of the SFU accepting the join. `Gone`: no packet for 30 s, or the RTC closed, died, or failed a poll. |
+| `leave(call_id)` | Drops the participant. No `Left` follows. | `Left {call_id, lost}` | `Timeout`: not connected within 15 s of the SFU accepting the join. `Gone`: no packet for 15 s, or the RTC closed, died, or failed a poll. |
 | `shutdown()` | Graceful stop | `Load {egress_kbps, participants}` | Every 5 s. Logged at debug. Once a minute while anyone is in a call, the media thread also logs one `media counters` line at info: `peers`, `audio_dropped`, `send_dropped`, `video_dropped`, `keyframe_asks`, `longest_turn_ms`. Totals only, with no identifiers. |
 
 There is no `EndRoom`: a deleted room ends each person's seat, and each one sends `leave`. Commands go through a bounded `std::sync::mpsc` channel of 1,024 with `try_send`, and wake the loop with the `Waker`; a full queue refuses a join with `media_unavailable`. Events go back through a bounded `tokio::sync::mpsc` channel of 1,024. `Speaking` and `Load` use `try_send` and are dropped when it is full; the rest wait for room.
@@ -418,7 +418,7 @@ Removal, room deletion, and a deleted session all reach the API as outbox events
 | TCP handshake and idle | A stream with no STUN for a participant within 5 s is closed. A stream with no whole frame for 30 s is closed; half-open ones end this way. | `sfu::Config::tcp_handshake`, `tcp_idle` |
 | Offers | 32 KiB. Audio m-lines up to the room cap, video up to 3, no other kinds. Over that is `bad_sdp`, checked before the media thread sees it. | `sfu::Config::offer_bytes`, `offer_audio` (set from `TINYSERVER_CALL_ROOM_MAX`), `offer_video` |
 | Renegotiation | `call.offer` shares the join and leave rate: 5 at once, then one every 3 s. | |
-| Consent | A connected participant the SFU hears nothing from for 30 s leaves with `media_lost`. str0m clients send STUN consent checks every few seconds even in silence. | `sfu::Config::consent_timeout` |
+| Consent | A connected participant the SFU hears nothing from for 15 s leaves with `media_lost`. str0m clients send STUN consent checks every few seconds even in silence. A client's own ICE gives up within 4 to 7 s and it joins again with a fresh offer, well before this. One out of touch for longer, socket included, finds itself absent from `ready` and joins again the same way. | `sfu::Config::consent_timeout` |
 | Camera | Simulcast `h` 1280×720 at about 1.2 Mb/s, `l` 640×360 at about 350 kb/s. 30 fps. What a client should send. | |
 | Camera from each publisher | Up to 2,400 kb/s of `h` and 700 kb/s of `l` is forwarded, each from a bucket of one second. A frame over it is dropped, and so is the rest of that layer until a keyframe fits. Those frames spend nothing, so the bucket fills for it. The SFU asks for a keyframe every 1 s while the layer is dropped, against every 300 ms otherwise, and not within 300 ms of one arriving. A layer dropped for 1 s gives way to the other. | `sfu::Config::camera_high_kbps`, `camera_low_kbps` |
 | Share | One per room. H.264 constrained baseline, one layer, up to 1920×1080 at 5–15 fps and about 2.5 Mb/s, with a content hint of `detail` or `text` so the encoder keeps text sharp over frame rate. What a client should send. The SDP says level 3.1 (`42e01f`) for all H.264, which tops out at 1280×720; the SFU never reads a stream's own SPS, so a share encoded at level 4.0 for 1080p passes through, and receivers decode it as hardware decoders do. | |
@@ -656,7 +656,7 @@ Cost, budgeted as if every byte both ways is billed: a 6-person camera call is a
 | Video receive | `Event::MediaData` on the video slot mid is one Annex B frame; `is_keyframe()` says whether it starts a picture. `call.slots` `video` says whose camera or share it is. It becomes `null` as soon as that source stops or the slot is planned empty, and it names a new source only when the SFU writes that source's first keyframe, so reset the decoder then. Before the first keyframe on a slot, drop frames. A frame str0m marks not `contiguous` was lost: drop frames until a keyframe, and ask for one with `direct_api().stream_rx_by_mid(video_slot, None).request_keyframe(Pli)` every 300 ms. |
 | REMB | A receiver that knows its link is slow can cap what it gets: `direct_api().stream_rx_by_mid(video_slot, None).request_remb(Bitrate::kbps(n))` every second. The tests use it to hold a listener on `l`. |
 | Mute | Send `call.state` and stop writing frames. The SFU drops a muted publisher's frames anyway. |
-| Leave | Send `call.leave`. A client that just stops is dropped after 30 s with `media_lost`. |
+| Leave | Send `call.leave`. A client that just stops is dropped after 15 s with `media_lost`. |
 
 `mediad` swaps the synthetic frames for its libopus encoder (mono, 32 kb/s, VOIP, FEC, DTX off, `usedtx=0`; the speech gate ends the spurt) and the real RFC 6464 level, and feeds received frames into its existing jitter buffer. For video it swaps the fixture for its camera and two H.264 encoders, and adds a decoder and one render surface.
 
