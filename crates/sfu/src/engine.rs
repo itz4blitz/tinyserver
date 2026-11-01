@@ -78,6 +78,8 @@ struct Inbound {
     /// A frame was dropped over budget. Nothing more is forwarded until a keyframe fits.
     broken: bool,
     asked: Option<Instant>,
+    /// The last keyframe that arrived, forwarded or not.
+    keyframe: Option<Instant>,
 }
 
 impl Inbound {
@@ -90,6 +92,7 @@ impl Inbound {
             seen: None,
             broken: false,
             asked: None,
+            keyframe: None,
         }
     }
 
@@ -103,6 +106,36 @@ impl Inbound {
     fn fresh(&self, now: Instant) -> bool {
         self.seen
             .is_some_and(|at| now.saturating_duration_since(at) < video::STALE)
+    }
+
+    /// Whether a frame of `size` bytes goes on. Over budget the layer breaks. A broken layer
+    /// spends nothing on frames that cannot pass, so the budget fills for the next keyframe.
+    fn admit(&mut self, keyframe: bool, size: u32, now: Instant) -> bool {
+        if keyframe {
+            self.keyframe = Some(now);
+        }
+        if self.broken && !keyframe {
+            return false;
+        }
+        let fits = self.budget.take(size, now);
+        self.broken = !fits;
+        if fits {
+            self.seen = Some(now);
+        }
+        fits
+    }
+
+    /// Whether a keyframe request may go out now. Not right after a keyframe, which the asker
+    /// is about to get, and less often while the layer is broken.
+    fn may_ask(&self, now: Instant) -> bool {
+        let every = if self.broken {
+            video::KEYFRAME_BROKEN_EVERY
+        } else {
+            video::KEYFRAME_EVERY
+        };
+        let since =
+            |at: Option<Instant>, gap| at.is_some_and(|at| now.saturating_duration_since(at) < gap);
+        self.arrived && !since(self.asked, every) && !since(self.keyframe, video::KEYFRAME_EVERY)
     }
 }
 
@@ -384,6 +417,10 @@ pub(crate) struct Engine {
 struct Counts {
     /// Audio frames over a publisher's budget.
     audio_dropped: u64,
+    /// Video frames over a layer's budget, or waiting for a keyframe after one.
+    video_dropped: u64,
+    /// Keyframe requests sent to publishers.
+    keyframe_asks: u64,
 }
 
 /// Marks the thread stopped however it ends, a panic included.
@@ -1416,17 +1453,13 @@ impl Engine {
         let inbound = &mut publisher.layers[layer.index()];
         inbound.arrived = true;
         inbound.rid = data.rid;
-        let fits = inbound.budget.take(size, now);
-        if !fits {
-            if !inbound.broken {
+        let was_broken = inbound.broken;
+        let pass = inbound.admit(keyframe, size, now);
+        if !pass {
+            self.counts.video_dropped += 1;
+            if !was_broken {
                 tracing::debug!(call_id = %publisher.call_id, reason = "budget", "media dropped");
             }
-            inbound.broken = true;
-        }
-        let pass = fits && (keyframe || !inbound.broken);
-        if pass {
-            inbound.broken = false;
-            inbound.seen = Some(now);
         }
         let room_id = publisher.room_id.clone();
         if !pass || !data.contiguous {
@@ -1483,8 +1516,8 @@ impl Engine {
         }
     }
 
-    /// Asks a publisher for a keyframe on one layer, at most every `KEYFRAME_EVERY`. A layer
-    /// that has not sent a frame has no rid to ask on yet.
+    /// Asks a publisher for a keyframe on one layer, as often as `Inbound::may_ask` lets it. A
+    /// layer that has not sent a frame has no rid to ask on yet.
     fn ask_keyframe(&mut self, publisher: PeerId, layer: Layer, now: Instant) {
         let Some(peer) = self.peers.get_mut(&publisher) else {
             return;
@@ -1497,14 +1530,11 @@ impl Engine {
             return;
         };
         let inbound = &mut peer.layers[layer.index()];
-        if !inbound.arrived
-            || inbound
-                .asked
-                .is_some_and(|at| now.saturating_duration_since(at) < video::KEYFRAME_EVERY)
-        {
+        if !inbound.may_ask(now) {
             return;
         }
         inbound.asked = Some(now);
+        self.counts.keyframe_asks += 1;
         let rid = inbound.rid;
         if let Some(mut writer) = peer.rtc.writer(mid) {
             if let Err(error) = writer.request_keyframe(rid, KeyframeRequestKind::Pli) {
@@ -1899,6 +1929,61 @@ mod tests {
             dropped += u32::from(!budget.take(SEALED_FRAME * 4, at));
         }
         assert!(dropped > 500, "only {dropped} of 1500 dropped");
+    }
+
+    const AT_30_FPS: Duration = Duration::from_millis(33);
+
+    /// A layer of 3,000 bytes a second, broken by a frame over its budget.
+    fn broken_layer(now: Instant) -> Inbound {
+        let mut layer = Inbound::new(24, now);
+        layer.arrived = true;
+        assert!(!layer.admit(false, 4000, now));
+        assert!(layer.broken);
+        layer
+    }
+
+    #[test]
+    fn a_broken_layer_saves_up_for_its_keyframe() {
+        let start = Instant::now();
+        let mut layer = broken_layer(start);
+        // Deltas that would each spend what came in since the last, if they were charged.
+        let mut at = start;
+        for _ in 0..60 {
+            at += AT_30_FPS;
+            assert!(
+                !layer.admit(false, 200, at),
+                "a delta passed a broken layer"
+            );
+        }
+        assert!(layer.admit(true, 2900, at), "the keyframe did not fit");
+        assert!(!layer.broken);
+        assert!(layer.fresh(at));
+    }
+
+    #[test]
+    fn a_keyframe_that_does_not_fit_leaves_the_layer_broken() {
+        let start = Instant::now();
+        let mut layer = broken_layer(start);
+        assert!(!layer.admit(true, 4000, start + AT_30_FPS));
+        assert!(layer.broken);
+        assert!(!layer.fresh(start + AT_30_FPS));
+    }
+
+    #[test]
+    fn keyframe_requests_back_off_while_broken_and_wait_after_a_keyframe() {
+        let start = Instant::now();
+        let mut layer = broken_layer(start);
+        assert!(layer.may_ask(start));
+        layer.asked = Some(start);
+        assert!(!layer.may_ask(start + video::KEYFRAME_EVERY));
+        assert!(layer.may_ask(start + video::KEYFRAME_BROKEN_EVERY));
+
+        let mut healthy = Inbound::new(2400, start);
+        assert!(!healthy.may_ask(start), "no frame has arrived");
+        assert!(healthy.admit(true, 100, start));
+        healthy.arrived = true;
+        assert!(!healthy.may_ask(start), "a keyframe just came");
+        assert!(healthy.may_ask(start + video::KEYFRAME_EVERY));
     }
 
     fn left(call_id: &str) -> Event {

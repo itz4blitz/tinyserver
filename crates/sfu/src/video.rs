@@ -20,6 +20,9 @@ pub(crate) const PROBE_KBPS: u64 = 2000;
 pub(crate) const STALE: Duration = Duration::from_secs(1);
 /// Keyframe requests to one layer of one publisher go out at most this often.
 pub(crate) const KEYFRAME_EVERY: Duration = Duration::from_millis(300);
+/// The same while the layer is over budget: asking faster than a keyframe can fit only makes
+/// the encoder send more.
+pub(crate) const KEYFRAME_BROKEN_EVERY: Duration = Duration::from_secs(1);
 /// A challenger takes the floor after being the loudest speaker this long.
 pub(crate) const TAKE_FLOOR: Duration = Duration::from_millis(800);
 /// While the holder still speaks, a challenger must be this much louder, in dB.
