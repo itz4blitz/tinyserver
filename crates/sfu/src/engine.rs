@@ -352,8 +352,9 @@ impl Tcp {
 }
 
 /// Events on their way to the API. The media thread must not wait for it, so what the queue
-/// cannot take now stays here in order, and `tick` tries again. These come from joins, leaves,
-/// and slot changes, which the API already limits, so they stay few if it stalls.
+/// cannot take now stays here in order, and `tick` tries again. Joins and leaves are few, because
+/// the API limits them. Slot maps follow the floor and every layer switch, so only each call's
+/// latest waits: nothing about a call comes after its `Left`, and the rest keep their order.
 struct Outbox {
     sender: async_mpsc::Sender<Event>,
     waiting: VecDeque<Event>,
@@ -369,8 +370,21 @@ impl Outbox {
 
     /// An event the API must see.
     fn tell(&mut self, event: Event) {
-        self.waiting.push_back(event);
+        match self.waiting_slots(&event) {
+            Some(waiting) => *waiting = event,
+            None => self.waiting.push_back(event),
+        }
         self.flush();
+    }
+
+    /// The slot map already waiting for the same call as `event`, if that is one too.
+    fn waiting_slots(&mut self, event: &Event) -> Option<&mut Event> {
+        let Event::Slots { call_id, .. } = event else {
+            return None;
+        };
+        self.waiting.iter_mut().find(
+            |waiting| matches!(waiting, Event::Slots { call_id: other, .. } if other == call_id),
+        )
     }
 
     /// An event that may be dropped when the queue is full.
@@ -2208,6 +2222,47 @@ mod tests {
         drop(receiver);
         outbox.tell(left("a"));
         assert!(outbox.waiting.is_empty());
+    }
+
+    fn slots(call_id: &str, mid: &str) -> Event {
+        Event::Slots {
+            call_id: call_id.to_string(),
+            audio: vec![Slot {
+                mid: mid.to_string(),
+                user_id: "u".to_string(),
+            }],
+            video: None,
+        }
+    }
+
+    #[test]
+    fn slot_maps_over_a_full_queue_keep_only_the_latest_for_each_call() {
+        let (sender, mut receiver) = async_mpsc::channel(1);
+        let mut outbox = Outbox::new(sender);
+        outbox.tell(slots("a", "0"));
+        for at in 1..1000 {
+            outbox.tell(slots("a", &at.to_string()));
+            outbox.tell(slots("b", &at.to_string()));
+        }
+        assert_eq!(outbox.waiting.len(), 2);
+        outbox.tell(left("c"));
+        outbox.tell(left("a"));
+        outbox.tell(slots("b", "last"));
+        let mut heard = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            heard.push(event);
+            outbox.flush();
+        }
+        assert_eq!(
+            heard,
+            vec![
+                slots("a", "0"),
+                slots("a", "999"),
+                slots("b", "last"),
+                left("c"),
+                left("a")
+            ]
+        );
     }
 
     #[test]
