@@ -106,7 +106,11 @@ struct Conn {
     id: u64,
     kick: oneshot::Sender<Close>,
     direct: mpsc::Sender<Arc<str>>,
+    proofs: mpsc::UnboundedSender<Proof>,
 }
+
+/// Answered once a socket has shown it is alive. Dropped if it closes first.
+pub(crate) type Proof = oneshot::Sender<()>;
 
 /// What a socket gets when it joins the hub.
 pub(crate) struct Joined {
@@ -115,6 +119,8 @@ pub(crate) struct Joined {
     pub presence: broadcast::Receiver<Arc<str>>,
     /// Frames for this socket alone.
     pub direct: mpsc::Receiver<Arc<str>>,
+    /// Asks this socket to show it is alive.
+    pub proofs: mpsc::UnboundedReceiver<Proof>,
     pub online: Vec<String>,
     pub calls: Vec<Occupancy>,
 }
@@ -242,11 +248,11 @@ impl Hub {
     }
 
     /// Adds a socket for `user_id`. The first one brings the person online. Past the per-user
-    /// cap, the oldest socket is told to close. If `session` holds their seat, the seat moves
-    /// here, and what the socket reads after `ready` catches it up.
-    pub fn join(&self, user_id: &str, bot: bool, session: Session) -> Joined {
+    /// cap, the oldest socket is told to close.
+    pub fn join(&self, user_id: &str, bot: bool) -> Joined {
         let (kick, kicked) = oneshot::channel();
         let (direct, inbox) = mpsc::channel(DIRECT);
+        let (proofs, asked) = mpsc::unbounded_channel();
         let mut people = lock(&self.people);
         people.next_conn += 1;
         let conn = people.next_conn;
@@ -261,18 +267,10 @@ impl Hub {
             id: conn,
             kick,
             direct,
+            proofs,
         });
         if arrived && !bot {
             self.announce(user_id, true);
-        }
-        if let Some(regained) = people.calls.regain(user_id, session, conn) {
-            tracing::info!(conn, "call seat regained");
-            let slots = regained
-                .call_id
-                .and_then(|call_id| people.slots.get(&call_id).cloned());
-            for frame in slots.into_iter().chain(regained.frames) {
-                people.direct(user_id, conn, frame);
-            }
         }
         // Subscribed under the lock, so every presence frame after this snapshot reaches it.
         let presence = self.ephemeral.subscribe();
@@ -288,9 +286,75 @@ impl Hub {
             kicked,
             presence,
             direct: inbox,
+            proofs: asked,
             online,
             calls: people.calls.snapshot(),
         }
+    }
+
+    /// Whether `session` is the device in `user_id`'s seat.
+    pub fn seated(&self, user_id: &str, session: Session) -> bool {
+        lock(&self.people).calls.seated(user_id, session)
+    }
+
+    /// The socket in `user_id`'s seat, if it is open and `session`'s, asked to show it is alive:
+    /// its id, and what answers. The answer's sender is dropped if the socket closes first.
+    pub fn challenge(
+        &self,
+        user_id: &str,
+        session: Session,
+    ) -> Option<(u64, oneshot::Receiver<()>)> {
+        let mut people = lock(&self.people);
+        if !people.calls.seated(user_id, session) {
+            return None;
+        }
+        let from = people.calls.conn_of(user_id)?;
+        let (proof, answered) = oneshot::channel();
+        if let Some(conn) = people
+            .users
+            .get(user_id)
+            .and_then(|person| person.conns.iter().find(|entry| entry.id == from))
+        {
+            let _ = conn.proofs.send(proof);
+        }
+        people.calls.contest(user_id);
+        Some((from, answered))
+    }
+
+    /// Socket `from` answered `challenge`, and keeps the seat.
+    pub fn kept(&self, user_id: &str, from: u64) {
+        lock(&self.people).calls.uncontest(user_id, from);
+    }
+
+    /// Moves `session`'s seat to socket `conn` if no socket holds it, or only `from`, which is
+    /// told it was replaced. The latest `call.slots` and what was held, to send. The seat keeps
+    /// the frames until `delivered`.
+    pub fn regain(
+        &self,
+        user_id: &str,
+        session: Session,
+        conn: u64,
+        from: Option<u64>,
+    ) -> Vec<Arc<str>> {
+        let mut people = lock(&self.people);
+        let Some(regained) = people.calls.regain(user_id, session, conn, from) else {
+            return Vec::new();
+        };
+        tracing::info!(conn, "call seat regained");
+        if let Some(person) = people.users.get_mut(user_id) {
+            if let Some(at) = person.conns.iter().position(|entry| Some(entry.id) == from) {
+                let _ = person.conns.remove(at).kick.send(Close::Replaced);
+            }
+        }
+        let slots = regained
+            .call_id
+            .and_then(|call_id| people.slots.get(&call_id).cloned());
+        slots.into_iter().chain(regained.frames).collect()
+    }
+
+    /// Socket `conn` sent what `regain` gave it.
+    pub fn delivered(&self, user_id: &str, conn: u64) {
+        lock(&self.people).calls.delivered(user_id, conn);
     }
 
     /// Removes a socket. When it was the person's last, they go offline after the grace.

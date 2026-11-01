@@ -39,6 +39,9 @@ pub struct Limits {
     pub recheck: Duration,
     /// How long a person stays online after their last socket closes.
     pub presence_grace: Duration,
+    /// How long a socket holding a call seat has to answer a ping when the same session opens
+    /// another. No answer moves the seat to the new socket.
+    pub seat_proof: Duration,
     /// A send that takes longer drops the socket.
     pub send_timeout: Duration,
     /// More missed events than this on resume gets `resync` instead.
@@ -72,6 +75,7 @@ impl Default for Limits {
             idle: Duration::from_secs(60),
             recheck: Duration::from_secs(60),
             presence_grace: Duration::from_secs(10),
+            seat_proof: Duration::from_secs(3),
             send_timeout: Duration::from_secs(10),
             replay_max: 1000,
             poll: Duration::from_secs(5),

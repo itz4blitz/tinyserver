@@ -153,7 +153,8 @@ pub(crate) struct Moderation {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Regained {
     pub call_id: Option<String>,
-    /// `call.e2ee` frames that came while no socket held the seat, in order.
+    /// `call.e2ee` frames that came while no socket held the seat, in order. The seat keeps them
+    /// until `delivered`, so a socket that fails on the way hands them to the next one.
     pub frames: Vec<Arc<str>>,
 }
 
@@ -167,6 +168,9 @@ struct Seat {
     /// `call.e2ee` frames for the next socket. A member who misses a commit cannot follow the
     /// group, so these are not dropped as other frames for a closed socket are.
     held: Vec<Arc<str>>,
+    /// The device's new socket is waiting to hear whether `conn` is alive. What goes to `conn`
+    /// meanwhile is kept in `held` too, in case it is not.
+    contested: bool,
     /// Their SFU participant. `None` for a join without media.
     call_id: Option<String>,
     muted: bool,
@@ -268,6 +272,7 @@ impl Calls {
                 seat.call_id = call_id;
                 seat.access = access;
                 seat.held.clear();
+                seat.contested = false;
                 if seat.e2ee != e2ee {
                     seat.e2ee = e2ee;
                     return Ok(vec![self.state(user_id)]);
@@ -291,6 +296,7 @@ impl Calls {
                 epoch: self.epoch,
                 session: None,
                 held: Vec::new(),
+                contested: false,
                 call_id,
                 muted: false,
                 deafened: false,
@@ -505,35 +511,75 @@ impl Calls {
         }
     }
 
-    /// A new socket `conn` opened for `session`. If that device holds `user_id`'s seat, the seat
-    /// moves to it, so a blip on the live socket leaves healthy media alone. A socket that has
-    /// not closed yet loses it too: a half-open one can take a minute to notice, and a device
-    /// has one live socket. Any other device of theirs takes the seat only with `call.join`.
-    pub fn regain(&mut self, user_id: &str, session: Session, conn: u64) -> Option<Regained> {
+    /// Whether `session` is the device in `user_id`'s seat.
+    pub fn seated(&self, user_id: &str, session: Session) -> bool {
+        self.seats
+            .get(user_id)
+            .is_some_and(|seat| seat.session == Some(session))
+    }
+
+    /// Socket `conn`, holding `user_id`'s seat, was asked to prove it is alive.
+    pub fn contest(&mut self, user_id: &str) {
+        if let Some(seat) = self.seats.get_mut(user_id) {
+            seat.contested = true;
+        }
+    }
+
+    /// Socket `from` proved it, and keeps the seat with everything it was sent meanwhile.
+    pub fn uncontest(&mut self, user_id: &str, from: u64) {
+        if let Some(seat) = self.seats.get_mut(user_id) {
+            seat.contested = false;
+            if seat.conn == Some(from) {
+                seat.held.clear();
+            }
+        }
+    }
+
+    /// Moves the seat to `conn`, the device's new socket, if `session` holds it and no socket
+    /// does, or only `from`, which did not prove it is alive. A blip on the live socket leaves
+    /// healthy media alone this way. Any other device takes the seat only with `call.join`.
+    pub fn regain(
+        &mut self,
+        user_id: &str,
+        session: Session,
+        conn: u64,
+        from: Option<u64>,
+    ) -> Option<Regained> {
         let seat = self.seats.get_mut(user_id)?;
-        if seat.session != Some(session) {
+        if seat.session != Some(session) || (seat.conn.is_some() && seat.conn != from) {
             return None;
         }
         seat.conn = Some(conn);
+        seat.contested = false;
         Some(Regained {
             call_id: seat.call_id.clone(),
-            frames: std::mem::take(&mut seat.held),
+            frames: seat.held.clone(),
         })
     }
 
-    /// Keeps `frame` if no socket holds `user_id`'s seat. False if one does, or they have none.
+    /// Socket `conn` sent what `regain` gave it.
+    pub fn delivered(&mut self, user_id: &str, conn: u64) {
+        if let Some(seat) = self.seats.get_mut(user_id) {
+            if seat.conn == Some(conn) {
+                seat.held.clear();
+            }
+        }
+    }
+
+    /// Keeps `frame` if no socket holds `user_id`'s seat, or while its socket is in doubt. True
+    /// if it should not be sent now: false if a socket should have it, or they have no seat.
     pub fn hold(&mut self, user_id: &str, frame: &Arc<str>) -> bool {
         let Some(seat) = self
             .seats
             .get_mut(user_id)
-            .filter(|seat| seat.conn.is_none())
+            .filter(|seat| seat.conn.is_none() || seat.contested)
         else {
             return false;
         };
         if seat.held.len() < HELD {
             seat.held.push(Arc::clone(frame));
         }
-        true
+        seat.conn.is_none()
     }
 
     /// Leaves if the seat is still the one `orphan` left, with no socket rejoined since.
@@ -701,10 +747,10 @@ mod tests {
         assert!(join(&mut calls, "u", "a", 1).is_ok());
         calls.set_session("u", [1; 32]);
         let epoch = calls.orphan("u", 1).expect("seat held by 1");
-        assert_eq!(calls.regain("u", [2; 32], 2), None, "another device");
+        assert_eq!(calls.regain("u", [2; 32], 2, None), None, "another device");
         assert_eq!(calls.conn_of("u"), None);
         assert_eq!(
-            calls.regain("u", [1; 32], 3),
+            calls.regain("u", [1; 32], 3, None),
             Some(Regained {
                 call_id: None,
                 frames: Vec::new()
@@ -716,10 +762,86 @@ mod tests {
     }
 
     #[test]
+    fn a_socket_still_up_loses_the_seat_only_to_a_claim_naming_it() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        assert_eq!(calls.regain("u", [1; 32], 2, None), None, "socket 1 is up");
+        assert_eq!(
+            calls.regain("u", [1; 32], 2, Some(9)),
+            None,
+            "not socket 9's"
+        );
+        assert_eq!(calls.conn_of("u"), Some(1));
+        assert!(calls.regain("u", [1; 32], 2, Some(1)).is_some());
+        assert_eq!(calls.conn_of("u"), Some(2));
+        assert_eq!(calls.regain("u", [1; 32], 3, Some(1)), None, "a late claim");
+        assert_eq!(calls.conn_of("u"), Some(2));
+    }
+
+    #[test]
+    fn held_frames_outlive_a_socket_that_fails_before_sending_them() {
+        let mut calls = Calls::default();
+        let frame: Arc<str> = Arc::from("frame");
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        calls.orphan("u", 1);
+        assert!(calls.hold("u", &frame));
+
+        // Socket 2 got them and died before it could send.
+        let first = calls
+            .regain("u", [1; 32], 2, None)
+            .expect("the same device");
+        assert_eq!(first.frames.len(), 1);
+        calls.orphan("u", 2);
+        assert!(calls.hold("u", &frame), "and more came");
+
+        let second = calls
+            .regain("u", [1; 32], 3, None)
+            .expect("the same device");
+        assert_eq!(second.frames.len(), 2);
+        calls.delivered("u", 2);
+        assert_eq!(
+            calls
+                .regain("u", [1; 32], 4, Some(3))
+                .map(|got| got.frames.len()),
+            Some(2),
+            "a stale socket clears nothing"
+        );
+        calls.delivered("u", 4);
+        calls.orphan("u", 4);
+        let last = calls
+            .regain("u", [1; 32], 5, None)
+            .expect("the same device");
+        assert!(last.frames.is_empty());
+    }
+
+    #[test]
+    fn frames_sent_while_a_socket_is_in_doubt_are_kept_for_whoever_wins() {
+        let mut calls = Calls::default();
+        let frame: Arc<str> = Arc::from("frame");
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+
+        calls.contest("u");
+        assert!(!calls.hold("u", &frame), "socket 1 gets it as well");
+        calls.uncontest("u", 1);
+        assert!(!calls.hold("u", &frame));
+        calls.contest("u");
+        calls.uncontest("u", 1);
+
+        calls.contest("u");
+        assert!(!calls.hold("u", &frame));
+        let regained = calls.regain("u", [1; 32], 2, Some(1)).expect("taken");
+        assert_eq!(regained.frames.len(), 1);
+        assert!(!calls.hold("u", &frame), "no longer in doubt");
+    }
+
+    #[test]
     fn a_seat_with_no_session_is_not_regained() {
         let mut calls = Calls::default();
         assert!(join(&mut calls, "u", "a", 1).is_ok());
-        assert_eq!(calls.regain("u", [1; 32], 2), None);
+        assert_eq!(calls.regain("u", [1; 32], 2, None), None);
         assert_eq!(calls.conn_of("u"), Some(1));
     }
 
@@ -735,7 +857,9 @@ mod tests {
         for _ in 0..HELD + 1 {
             assert!(calls.hold("u", &frame));
         }
-        let regained = calls.regain("u", [1; 32], 2).expect("the same device");
+        let regained = calls
+            .regain("u", [1; 32], 2, None)
+            .expect("the same device");
         assert_eq!(regained.frames.len(), HELD);
         assert!(!calls.hold("u", &frame), "the socket is back");
     }
@@ -748,7 +872,10 @@ mod tests {
         calls.orphan("u", 1);
         assert!(calls.hold("u", &Arc::from("frame")));
         assert!(join(&mut calls, "u", "a", 2).is_ok());
-        let regained = calls.regain("u", [1; 32], 3).expect("the same device");
+        calls.orphan("u", 2);
+        let regained = calls
+            .regain("u", [1; 32], 3, None)
+            .expect("the same device");
         assert!(regained.frames.is_empty());
     }
 
