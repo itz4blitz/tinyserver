@@ -1772,7 +1772,7 @@ impl Engine {
             _ if share.is_some() && wants_share => video::SHARE_KBPS,
             Some(_) if allowed == Quality::High => video::PROBE_KBPS,
             None if paused && allowed == Quality::High => video::PROBE_KBPS,
-            None if paused => video::RESUME_PROBE_KBPS,
+            None if paused => video::resume_probe_kbps(peer.audio_kbps),
             _ => video::LOW_KBPS,
         };
         let Some(peer) = self.peers.get_mut(&id) else {

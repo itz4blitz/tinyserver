@@ -24,8 +24,9 @@ pub(crate) const PAUSE_KBPS: u64 = 250;
 pub(crate) const RESUME_KBPS: u64 = 450;
 /// What a listener's bandwidth estimator probes for while it wants `h`.
 pub(crate) const PROBE_KBPS: u64 = 2000;
-/// What it probes for while paused, to find `RESUME_KBPS` above whatever audio it gets.
-pub(crate) const RESUME_PROBE_KBPS: u64 = 700;
+/// How far past `RESUME_KBPS` it probes while paused, and the steps it moves in.
+const RESUME_MARGIN_KBPS: u64 = 250;
+const RESUME_STEP_KBPS: u64 = 50;
 /// A layer with no frame for this long is not chosen while the other one is sending.
 pub(crate) const STALE: Duration = Duration::from_secs(1);
 /// Keyframe requests to one layer of one publisher go out at most this often.
@@ -39,6 +40,13 @@ pub(crate) const TAKE_FLOOR: Duration = Duration::from_millis(800);
 pub(crate) const FLOOR_MARGIN: f32 = 6.0;
 /// The 90 kHz RTP clock of every video codec.
 const VIDEO_HZ: u64 = 90_000;
+
+/// What a paused listener probes for, to find `RESUME_KBPS` above the `audio_kbps` it gets. The
+/// estimate settles about here, so a fixed target would stop short of it in a talkative room.
+pub(crate) fn resume_probe_kbps(audio_kbps: u64) -> u64 {
+    let target = RESUME_KBPS + RESUME_MARGIN_KBPS + audio_kbps;
+    target.div_ceil(RESUME_STEP_KBPS) * RESUME_STEP_KBPS
+}
 
 /// One simulcast layer of a camera, or a share's one layer. `h` is high, `l` is low; a
 /// camera without rids is high.
@@ -469,6 +477,21 @@ mod tests {
         assert!(!gate.allows(true, Some(Fit::Audio), HOLD, start));
         // With no estimate yet it still gets its try.
         assert!(ShareGate::default().allows(false, None, HOLD, start));
+    }
+
+    #[test]
+    fn the_resume_probe_reaches_resume_above_the_audio() {
+        assert_eq!(resume_probe_kbps(0), 700);
+        for audio in [0, 49, 50, 128, 304, 1000] {
+            let spare = resume_probe_kbps(audio) - audio;
+            assert_eq!(
+                Fit::of(spare, Fit::Audio),
+                Fit::Low,
+                "{audio} kb/s of audio"
+            );
+        }
+        // Audio wobbles from one second to the next. The target need not.
+        assert_eq!(resume_probe_kbps(301), resume_probe_kbps(304));
     }
 
     #[test]
