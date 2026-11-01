@@ -219,6 +219,8 @@ struct Peer {
     rtt: Option<Duration>,
     rtt_least: Option<Duration>,
     /// The link showed it is full in the last second.
+    full: bool,
+    /// It did in the second before that too.
     congested: bool,
     told_video: Option<VideoSlot>,
     timeout: Instant,
@@ -891,6 +893,7 @@ impl Engine {
             loss: None,
             rtt: None,
             rtt_least: None,
+            full: false,
             congested: false,
             told_video: None,
             timeout: now,
@@ -1369,12 +1372,15 @@ impl Engine {
                     .rtt
                     .zip(peer.rtt_least)
                     .map(|(rtt, least)| rtt.saturating_sub(least));
-                peer.congested = video::congested(
-                    peer.audio_kbps + peer.video_kbps,
+                let full = video::congested(
+                    peer.audio_kbps,
+                    peer.video_kbps,
                     peer.twcc,
                     peer.loss,
                     queue,
                 );
+                peer.congested = full && peer.full;
+                peer.full = full;
                 if let Some(screen) = &peer.screen {
                     tracing::debug!(
                         call_id = %peer.call_id,

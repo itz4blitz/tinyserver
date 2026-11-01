@@ -32,8 +32,12 @@ const RESUME_STEP_KBPS: u64 = 50;
 const BUSY_PERCENT: u64 = 80;
 /// The loss that shows a link is full. Less is what a lossy link does at any rate.
 const FULL_LOSS: f32 = 0.10;
-/// The round trip above its lowest that shows a queue building, which jitter stays under.
-const FULL_QUEUE: Duration = Duration::from_millis(150);
+/// The round trip above its lowest that shows a queue building. 30 ms of jitter each way reached
+/// 184 ms in a real call, and a 250 ms queue 205 ms.
+const FULL_QUEUE: Duration = Duration::from_millis(200);
+/// The least video, in kb/s, worth blaming. Audio is never given up, so audio alone that fills a
+/// lossy link's low estimate says nothing about what taking the video away would do.
+const VIDEO_LEAST: u64 = 50;
 /// How many holds the wait before trying again after a withdrawal can grow to.
 const RETRY_MOST: u32 = 12;
 /// A layer with no frame for this long is not chosen while the other one is sending.
@@ -143,18 +147,21 @@ impl Fit {
 /// Whether a link is really full. An estimate alone cannot say: it follows what is sent, so a
 /// still screen or a quiet call reads as a slow link. So the link must have been asked for about
 /// what the estimate says it holds, and must show it: packets lost, or a queue building. str0m
-/// has no way to read its own pacer's queue, so the queue is the one on the path. `sent` and
-/// `estimate` are in kb/s, `loss` the share lost, and `queue` the round trip above its lowest.
+/// has no way to read its own pacer's queue, so the queue is the one on the path. Rates are in
+/// kb/s, `loss` the share lost, and `queue` the round trip above its lowest. One second's look:
+/// a lossy, jittery link can show this for a second, so it counts only twice running.
 pub(crate) fn congested(
-    sent: u64,
+    audio: u64,
+    video: u64,
     estimate: Option<u64>,
     loss: Option<f32>,
     queue: Option<Duration>,
 ) -> bool {
+    let sent = audio + video;
     let busy = estimate.is_some_and(|estimate| sent * 100 >= estimate * BUSY_PERCENT);
     let full = loss.is_some_and(|loss| loss >= FULL_LOSS)
         || queue.is_some_and(|queue| queue >= FULL_QUEUE);
-    busy && full
+    video >= VIDEO_LEAST && busy && full
 }
 
 /// One look at a listener's link, each in kb/s less the audio it gets.
@@ -596,18 +603,26 @@ mod tests {
         let lost = Some(0.2);
         let queue = Some(Duration::from_millis(300));
         // A still screen, however low the estimate, or lost packets on a lossy link.
-        assert!(!congested(100, Some(250), lost, queue));
+        assert!(!congested(50, 50, Some(250), lost, queue));
         // Sent all it could, and nothing shows.
-        assert!(!congested(500, Some(250), Some(0.0), None));
-        assert!(!congested(
-            500,
-            Some(250),
-            Some(0.03),
-            Some(Duration::from_millis(60))
-        ));
-        assert!(congested(500, Some(250), lost, None));
-        assert!(congested(500, Some(250), None, queue));
-        assert!(!congested(500, None, lost, queue), "no estimate");
+        assert!(!congested(100, 400, Some(250), Some(0.0), None));
+        let jitter = Some(Duration::from_millis(184));
+        assert!(!congested(100, 400, Some(250), Some(0.03), jitter));
+        assert!(congested(100, 400, Some(250), lost, None));
+        assert!(congested(100, 400, Some(250), None, queue));
+        assert!(!congested(100, 400, None, lost, queue), "no estimate");
+    }
+
+    /// A lossy link pins the estimate near the audio. In a real call that read as a full link
+    /// with nothing to take away, and kept a viewer's share off it.
+    #[test]
+    fn audio_alone_never_shows_a_link_is_full() {
+        let queue = Some(Duration::from_millis(300));
+        assert!(!congested(85, 0, Some(78), Some(0.2), queue));
+        assert!(
+            !congested(85, 8, Some(78), Some(0.2), queue),
+            "a still screen"
+        );
     }
 
     #[test]
