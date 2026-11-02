@@ -34,7 +34,7 @@
 //! The share sends the `h` clip, tagged layer `s` and padded to the share's 2.5 Mb/s.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -224,24 +224,32 @@ impl Client {
             candidate.map_err(|error| io::Error::other(format!("candidate: {error:?}")))?;
         rtc.add_local_candidate(candidate);
 
-        let mut change = rtc.sdp_api();
-        let microphone = change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-        for _ in 0..slots {
-            change.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
-        }
-        let mut layers = Simulcast::new();
-        for layer in &LAYERS {
-            layers.add_send_layer(SimulcastLayer::new(layer.rid));
-        }
-        let camera = change.add_media(
-            MediaKind::Video,
-            Direction::Inactive,
-            None,
-            None,
-            Some(layers),
-        );
-        let share = change.add_media(MediaKind::Video, Direction::Inactive, None, None, None);
-        let screen = change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        // str0m checks a new mid against the session's, not the others in this change. Fifteen
+        // random mids of three characters collide about once in 2,000 offers, and two m-lines
+        // on one mid break the next offer. An unapplied change leaves `rtc` as it was.
+        let (change, microphone, camera, share, screen) = loop {
+            let mut change = rtc.sdp_api();
+            let mut mids = HashSet::new();
+            let mut add = |direction, kind, layers| {
+                let mid = change.add_media(kind, direction, None, None, layers);
+                mids.insert(mid);
+                mid
+            };
+            let microphone = add(Direction::SendOnly, MediaKind::Audio, None);
+            for _ in 0..slots {
+                add(Direction::RecvOnly, MediaKind::Audio, None);
+            }
+            let mut layers = Simulcast::new();
+            for layer in &LAYERS {
+                layers.add_send_layer(SimulcastLayer::new(layer.rid));
+            }
+            let camera = add(Direction::Inactive, MediaKind::Video, Some(layers));
+            let share = add(Direction::Inactive, MediaKind::Video, None);
+            let screen = add(Direction::RecvOnly, MediaKind::Video, None);
+            if mids.len() == slots + 4 {
+                break (change, microphone, camera, share, screen);
+            }
+        };
         let (offer, pending) = change
             .apply()
             .ok_or_else(|| io::Error::other("nothing to offer"))?;
