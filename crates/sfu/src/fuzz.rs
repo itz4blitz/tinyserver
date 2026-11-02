@@ -14,7 +14,7 @@ use str0m::{Input, Output, Rtc, RtcConfig};
 use crate::engine::{candidates, rtc_config, H264_PROFILE};
 use crate::sdp::{share_sending, Caps};
 use crate::tcp::{encode, BadFrame, Framer, FRAME_MAX};
-use crate::video::{ceiling, pick_layer, Floor, Layer, Link, Quality, Rebase};
+use crate::video::{ceiling, pick_layer, Floor, Layer, Link, Quality, Reading, Rebase};
 use crate::Config;
 
 const PUBLIC: SocketAddr =
@@ -216,8 +216,12 @@ pub fn video(data: &[u8]) {
                 if budget.is_none() {
                     assert!(most.share && most.camera == Quality::High);
                 }
-                let estimate = (a % 2 == 1).then_some(value >> 8);
-                let fit = link.update(estimate, Duration::from_millis(u64::from(*b)), at);
+                let reading = Reading {
+                    told: (a & 2 == 2).then_some(value >> 24),
+                    estimate: (a % 2 == 1).then_some(value >> 8),
+                    congested: a & 4 == 4,
+                };
+                let fit = link.update(reading, Duration::from_millis(u64::from(*b)), at);
                 let layer = pick_layer(fit, quality, most.camera);
                 if most.camera == Quality::Off || quality == Quality::Off {
                     assert_eq!(layer, None);
