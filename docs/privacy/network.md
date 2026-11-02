@@ -82,10 +82,10 @@ What exists (`docs/calls.md` "Limits", `crates/sfu`):
 | Limit | Value | Setting |
 |---|---|---|
 | People per room call, on the server | 12 (room `user_limit` 1 to 99, capped by the server value), 32 | `TINYSERVER_CALL_ROOM_MAX`, `TINYSERVER_CALL_SERVER_MAX` |
-| Forwarded audio per publisher | 64 kb/s | `sfu::Config::audio_kbps` |
+| Forwarded audio per publisher | 192 kb/s | `sfu::Config::audio_kbps` |
 | Camera per publisher | 2,400 kb/s high layer, 700 kb/s low | `camera_high_kbps`, `camera_low_kbps` |
 | Share per publisher | 5,000 kb/s | `share_kbps` |
-| Packets per source address | 1,000 a second, burst 2,000; 4,096 sources | `packets_per_second`, `packet_burst` |
+| Packets per source address | 2,000 a second, burst 4,000; 4,096 sources | `packets_per_second`, `packet_burst` |
 | TCP streams | 256, 16 per source, 64 unverified; 5 s handshake, 30 s idle | `tcp_*` |
 | Upload budget for all calls | None unless set | `TINYSERVER_MEDIA_EGRESS_KBPS` (kb/s; a non-positive value fails startup) |
 | Container limits | tinyserver 1 GB, 2 CPUs, 512 pids; Postgres 1 GB; clamd 3 GB; Pocket ID and cloudflared 256 MB | compose variables |

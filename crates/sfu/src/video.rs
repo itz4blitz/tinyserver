@@ -11,21 +11,55 @@ pub(crate) const LOW_KBPS: u64 = 350;
 pub(crate) const SHARE_KBPS: u64 = 2500;
 /// One forwarded audio stream with its headers, in kb/s, for the upload budget.
 pub(crate) const AUDIO_KBPS: u64 = 50;
-/// A listener on `l` moves up to `h` at this estimate, and back down below `DOWN_KBPS`.
+/// A listener on `l` moves up to `h` at this much room for video, and back down below
+/// `DOWN_KBPS`.
 pub(crate) const UP_KBPS: u64 = 1600;
 pub(crate) const DOWN_KBPS: u64 = 1300;
+/// A share gives way to a camera below `SHARE_DOWN_KBPS`, and comes back at `SHARE_UP_KBPS`.
+pub(crate) const SHARE_UP_KBPS: u64 = 1000;
+pub(crate) const SHARE_DOWN_KBPS: u64 = 800;
+/// Video pauses below `PAUSE_KBPS`, so it cannot starve the audio of a link that small, and
+/// resumes on a keyframe at `RESUME_KBPS`.
+pub(crate) const PAUSE_KBPS: u64 = 250;
+pub(crate) const RESUME_KBPS: u64 = 450;
 /// What a listener's bandwidth estimator probes for while it wants `h`.
 pub(crate) const PROBE_KBPS: u64 = 2000;
+/// How far past `RESUME_KBPS` it probes while paused, and the steps it moves in.
+const RESUME_MARGIN_KBPS: u64 = 250;
+const RESUME_STEP_KBPS: u64 = 50;
+/// What the link was asked to carry, as a percentage of the estimate, before the estimate says
+/// anything about the link. Below this the sender is what limits the estimate.
+const BUSY_PERCENT: u64 = 80;
+/// The loss that shows a link is full. Less is what a lossy link does at any rate.
+const FULL_LOSS: f32 = 0.10;
+/// The round trip above its lowest that shows a queue building. 30 ms of jitter each way reached
+/// 184 ms in a real call, and a 250 ms queue 205 ms.
+const FULL_QUEUE: Duration = Duration::from_millis(200);
+/// The least video, in kb/s, worth blaming. Audio is never given up, so audio alone that fills a
+/// lossy link's low estimate says nothing about what taking the video away would do.
+const VIDEO_LEAST: u64 = 50;
+/// How many holds the wait before trying again after a withdrawal can grow to.
+const RETRY_MOST: u32 = 12;
 /// A layer with no frame for this long is not chosen while the other one is sending.
 pub(crate) const STALE: Duration = Duration::from_secs(1);
 /// Keyframe requests to one layer of one publisher go out at most this often.
 pub(crate) const KEYFRAME_EVERY: Duration = Duration::from_millis(300);
+/// The same while the layer is over budget: asking faster than a keyframe can fit only makes
+/// the encoder send more.
+pub(crate) const KEYFRAME_BROKEN_EVERY: Duration = Duration::from_secs(1);
 /// A challenger takes the floor after being the loudest speaker this long.
 pub(crate) const TAKE_FLOOR: Duration = Duration::from_millis(800);
 /// While the holder still speaks, a challenger must be this much louder, in dB.
 pub(crate) const FLOOR_MARGIN: f32 = 6.0;
 /// The 90 kHz RTP clock of every video codec.
 const VIDEO_HZ: u64 = 90_000;
+
+/// What a paused listener probes for, to find `RESUME_KBPS` above the `audio_kbps` it gets. The
+/// estimate settles about here, so a fixed target would stop short of it in a talkative room.
+pub(crate) fn resume_probe_kbps(audio_kbps: u64) -> u64 {
+    let target = RESUME_KBPS + RESUME_MARGIN_KBPS + audio_kbps;
+    target.div_ceil(RESUME_STEP_KBPS) * RESUME_STEP_KBPS
+}
 
 /// One simulcast layer of a camera, or a share's one layer. `h` is high, `l` is low; a
 /// camera without rids is high.
@@ -71,32 +105,191 @@ pub enum Quality {
     High,
 }
 
-/// The layer a listener should get. `current` is the one it wants now, for hysteresis.
-/// `estimate` is its bandwidth estimate in kb/s; with none yet it starts on `l`.
-pub(crate) fn pick_layer(
-    current: Option<Layer>,
-    estimate: Option<u64>,
-    quality: Quality,
-    ceiling: Quality,
-) -> Option<Layer> {
-    match quality.min(ceiling) {
-        Quality::Off => None,
-        Quality::Low => Some(Layer::Low),
-        Quality::High => {
-            let Some(estimate) = estimate else {
-                return Some(Layer::Low);
-            };
-            let floor = if current == Some(Layer::High) {
-                DOWN_KBPS
-            } else {
-                UP_KBPS
-            };
-            Some(if estimate >= floor {
-                Layer::High
-            } else {
-                Layer::Low
-            })
+/// What a listener's link has room for beside its audio, lowest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Fit {
+    /// No video at all.
+    Audio,
+    /// `l`.
+    Low,
+    /// `l`, or a share.
+    Share,
+    /// Anything.
+    High,
+}
+
+impl Fit {
+    /// Each step above audio, highest first: the kb/s that reaches it, and what keeps it.
+    const STEPS: [(Self, u64, u64); 3] = [
+        (Self::High, UP_KBPS, DOWN_KBPS),
+        (Self::Share, SHARE_UP_KBPS, SHARE_DOWN_KBPS),
+        (Self::Low, RESUME_KBPS, PAUSE_KBPS),
+    ];
+
+    /// The most `kbps` carries for a listener at `from`.
+    fn of(kbps: u64, from: Self) -> Self {
+        Self::STEPS
+            .iter()
+            .find(|(step, up, down)| kbps >= if from >= *step { *down } else { *up })
+            .map_or(Self::Audio, |(step, _, _)| *step)
+    }
+
+    /// The camera layers this leaves room for.
+    pub fn quality(self) -> Quality {
+        match self {
+            Self::Audio => Quality::Off,
+            Self::Low | Self::Share => Quality::Low,
+            Self::High => Quality::High,
         }
+    }
+}
+
+/// Whether a link is really full. An estimate alone cannot say: it follows what is sent, so a
+/// still screen or a quiet call reads as a slow link. So the link must have been asked for about
+/// what the estimate says it holds, and must show it: packets lost, or a queue building. str0m
+/// has no way to read its own pacer's queue, so the queue is the one on the path. Rates are in
+/// kb/s, `loss` the share lost, and `queue` the round trip above its lowest. One second's look:
+/// a lossy, jittery link can show this for a second, so it counts only twice running.
+pub(crate) fn congested(
+    audio: u64,
+    video: u64,
+    estimate: Option<u64>,
+    loss: Option<f32>,
+    queue: Option<Duration>,
+) -> bool {
+    let sent = audio + video;
+    let busy = estimate.is_some_and(|estimate| sent * 100 >= estimate * BUSY_PERCENT);
+    let full = loss.is_some_and(|loss| loss >= FULL_LOSS)
+        || queue.is_some_and(|queue| queue >= FULL_QUEUE);
+    video >= VIDEO_LEAST && busy && full
+}
+
+/// One look at a listener's link, each in kb/s less the audio it gets.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Reading {
+    /// What the receiver reported itself, which needs no evidence.
+    pub told: Option<u64>,
+    /// str0m's estimate.
+    pub estimate: Option<u64>,
+    /// See [`congested`].
+    pub congested: bool,
+}
+
+/// What was taken from a listener, and when it is tried again.
+#[derive(Debug, Clone, Copy)]
+struct Withdrawn {
+    from: Option<Fit>,
+    retry: Instant,
+}
+
+/// Follows what one listener's link can carry. Down at once on evidence, because a full link is
+/// losing audio now, and never on an estimate alone. Up as soon as an estimate has held for a
+/// hold, so the video does not flap on a link that only looks better for a moment. Whatever was
+/// taken comes back to be tried again after a wait that grows while it keeps failing, so no
+/// listener is left without video because of how a link once looked.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Link {
+    /// What the link is known to have room for. `None` until there is word of that: `l`, and
+    /// any share.
+    fit: Option<Fit>,
+    rising: Option<Instant>,
+    withdrawn: Option<Withdrawn>,
+    /// The wait after the last withdrawal, and when what it took was last tried again.
+    wait: Duration,
+    tried: Option<Instant>,
+}
+
+impl Link {
+    pub fn update(&mut self, reading: Reading, hold: Duration, now: Instant) -> Option<Fit> {
+        let room = match (reading.told, reading.estimate) {
+            (Some(told), Some(estimate)) => Some(told.min(estimate)),
+            (told, estimate) => told.or(estimate),
+        };
+        let Some(room) = room else {
+            return self.retry(reading, now);
+        };
+        let held = self.fit.unwrap_or(Fit::High);
+        let limit = if reading.congested {
+            Some(room)
+        } else {
+            reading.told
+        };
+        match limit.map(|limit| Fit::of(limit, held)) {
+            Some(target) if target < held => {
+                self.withdraw(target, hold, now);
+                return self.fit;
+            }
+            Some(target) if self.fit.is_none() => self.fit = Some(target),
+            _ => {}
+        }
+        let Some(fit) = self.fit else {
+            // Good news needs no wait the first time. Anything less says nothing yet.
+            let target = Fit::of(room, Fit::High);
+            self.fit = (target >= Fit::Share).then_some(target);
+            return self.fit;
+        };
+        let target = Fit::of(room, fit);
+        if target <= fit {
+            self.rising = None;
+            return self.retry(reading, now);
+        }
+        let since = *self.rising.get_or_insert(now);
+        if now.saturating_duration_since(since) >= hold {
+            self.fit = Some(target);
+            self.rising = None;
+            if self.withdrawn.is_some_and(|gone| gone.from <= Some(target)) {
+                self.withdrawn = None;
+            }
+        }
+        self.fit
+    }
+
+    /// Takes the link down to `fit`, to be tried again later, sooner if it held for a while.
+    fn withdraw(&mut self, fit: Fit, hold: Duration, now: Instant) {
+        let failing = self
+            .tried
+            .is_some_and(|at| now.saturating_duration_since(at) < self.wait * 2);
+        self.wait = if failing {
+            (self.wait * 2).min(hold * RETRY_MOST)
+        } else {
+            hold
+        };
+        let from = self.withdrawn.map_or(self.fit, |gone| gone.from);
+        self.withdrawn = Some(Withdrawn {
+            from,
+            retry: now + self.wait,
+        });
+        self.fit = Some(fit);
+        self.rising = None;
+    }
+
+    /// Puts back what was taken, if its wait is over and the receiver has not said otherwise.
+    fn retry(&mut self, reading: Reading, now: Instant) -> Option<Fit> {
+        if let Some(gone) = self.withdrawn {
+            let forbidden = reading
+                .told
+                .is_some_and(|told| Fit::of(told, Fit::Audio) < gone.from.unwrap_or(Fit::High));
+            if now >= gone.retry && !forbidden && !reading.congested {
+                self.fit = gone.from;
+                self.withdrawn = None;
+                self.tried = Some(now);
+            }
+        }
+        self.fit
+    }
+
+    pub fn fit(&self) -> Option<Fit> {
+        self.fit
+    }
+}
+
+/// The layer a listener should get. `fit` is what its link has room for; with no estimate yet
+/// it starts on `l`.
+pub(crate) fn pick_layer(fit: Option<Fit>, quality: Quality, ceiling: Quality) -> Option<Layer> {
+    match (quality.min(ceiling), fit) {
+        (Quality::Off, _) | (_, Some(Fit::Audio)) => None,
+        (Quality::High, Some(Fit::High)) => Some(Layer::High),
+        _ => Some(Layer::Low),
     }
 }
 
@@ -274,42 +467,202 @@ mod tests {
         assert_eq!(Layer::Share.other(), Layer::Share);
     }
 
+    const HOLD: Duration = Duration::from_secs(5);
+
     #[test]
-    fn the_layer_follows_the_estimate_with_hysteresis() {
-        let high = Quality::High;
-        assert_eq!(pick_layer(None, None, high, high), Some(Layer::Low));
-        assert_eq!(pick_layer(None, Some(500), high, high), Some(Layer::Low));
+    fn what_fits_follows_the_room_for_video_with_hysteresis() {
+        assert_eq!(Fit::of(5000, Fit::Audio), Fit::High);
+        assert_eq!(Fit::of(UP_KBPS - 1, Fit::Low), Fit::Share);
+        assert_eq!(Fit::of(UP_KBPS - 1, Fit::High), Fit::High);
+        assert_eq!(Fit::of(DOWN_KBPS, Fit::High), Fit::High);
+        assert_eq!(Fit::of(DOWN_KBPS - 1, Fit::High), Fit::Share);
+        assert_eq!(Fit::of(SHARE_UP_KBPS - 1, Fit::Low), Fit::Low);
+        assert_eq!(Fit::of(SHARE_DOWN_KBPS, Fit::Share), Fit::Share);
+        assert_eq!(Fit::of(SHARE_DOWN_KBPS - 1, Fit::Share), Fit::Low);
+        assert_eq!(Fit::of(RESUME_KBPS - 1, Fit::Audio), Fit::Audio);
+        assert_eq!(Fit::of(RESUME_KBPS, Fit::Audio), Fit::Low);
+        assert_eq!(Fit::of(PAUSE_KBPS, Fit::Low), Fit::Low);
+        assert_eq!(Fit::of(PAUSE_KBPS - 1, Fit::Low), Fit::Audio);
+    }
+
+    fn told(kbps: u64) -> Reading {
+        Reading {
+            told: Some(kbps),
+            ..Reading::default()
+        }
+    }
+
+    /// The estimator's figure with nothing to back it, as on a still screen.
+    fn idle(kbps: u64) -> Reading {
+        Reading {
+            estimate: Some(kbps),
+            ..Reading::default()
+        }
+    }
+
+    fn full(kbps: u64) -> Reading {
+        Reading {
+            estimate: Some(kbps),
+            congested: true,
+            ..Reading::default()
+        }
+    }
+
+    #[test]
+    fn a_link_drops_at_once_and_climbs_only_after_the_hold() {
+        let start = Instant::now();
+        let mut link = Link::default();
+        let none = Reading::default();
+        assert_eq!(link.update(none, HOLD, start), None);
+        assert_eq!(link.update(told(5000), HOLD, start), Some(Fit::High));
+        assert_eq!(link.update(told(200), HOLD, start), Some(Fit::Audio));
+        assert_eq!(link.update(told(5000), HOLD, start), Some(Fit::Audio));
+        let almost = start + HOLD - Duration::from_millis(1);
+        assert_eq!(link.update(told(5000), HOLD, almost), Some(Fit::Audio));
+        assert_eq!(link.update(told(5000), HOLD, start + HOLD), Some(Fit::High));
+    }
+
+    #[test]
+    fn a_dip_starts_the_hold_over() {
+        let start = Instant::now();
+        let mut link = Link::default();
+        link.update(told(500), HOLD, start);
+        assert_eq!(link.update(told(5000), HOLD, start), Some(Fit::Low));
+        let dip = start + HOLD / 2;
+        assert_eq!(link.update(told(500), HOLD, dip), Some(Fit::Low));
+        assert_eq!(link.update(told(5000), HOLD, dip), Some(Fit::Low));
+        assert_eq!(link.update(told(5000), HOLD, start + HOLD), Some(Fit::Low));
+        assert_eq!(link.update(told(5000), HOLD, dip + HOLD), Some(Fit::High));
+    }
+
+    #[test]
+    fn good_news_is_taken_at_once_and_a_low_first_estimate_means_nothing() {
+        let start = Instant::now();
+        // A little audio off the estimator's 1,000 kb/s start.
         assert_eq!(
-            pick_layer(Some(Layer::Low), Some(1500), high, high),
-            Some(Layer::Low)
+            Link::default().update(idle(950), HOLD, start),
+            Some(Fit::Share)
         );
-        assert_eq!(
-            pick_layer(Some(Layer::Low), Some(UP_KBPS), high, high),
-            Some(Layer::High)
-        );
-        assert_eq!(
-            pick_layer(Some(Layer::High), Some(1400), high, high),
-            Some(Layer::High)
-        );
-        assert_eq!(
-            pick_layer(Some(Layer::High), Some(DOWN_KBPS - 1), high, high),
-            Some(Layer::Low)
+        assert_eq!(Link::default().update(idle(150), HOLD, start), None);
+        assert_eq!(Link::default().update(idle(500), HOLD, start), None);
+    }
+
+    /// The call that found this: a still screen, whose estimate sat under 300 kb/s.
+    #[test]
+    fn an_estimate_with_nothing_behind_it_takes_nothing_away() {
+        let start = Instant::now();
+        let mut link = Link::default();
+        link.update(idle(5000), HOLD, start);
+        for second in 1..120 {
+            let at = start + Duration::from_secs(second);
+            assert_eq!(link.update(idle(150), HOLD, at), Some(Fit::High));
+        }
+    }
+
+    #[test]
+    fn what_was_withdrawn_is_always_tried_again_and_the_wait_grows() {
+        let start = Instant::now();
+        let mut link = Link::default();
+        link.update(idle(5000), HOLD, start);
+        let mut at = start;
+        for wait in [1, 2, 4, 8, 12, 12] {
+            assert_eq!(link.update(full(200), HOLD, at), Some(Fit::Audio));
+            let due = at + HOLD * wait;
+            let before = due - Duration::from_millis(1);
+            assert_eq!(link.update(idle(200), HOLD, before), Some(Fit::Audio));
+            assert_eq!(
+                link.update(idle(200), HOLD, due),
+                Some(Fit::High),
+                "after {wait} holds"
+            );
+            at = due + Duration::from_secs(1);
+        }
+        // One that holds starts the wait over.
+        at += HOLD * RETRY_MOST * 3;
+        link.update(full(200), HOLD, at);
+        assert_eq!(link.update(idle(200), HOLD, at + HOLD), Some(Fit::High));
+    }
+
+    #[test]
+    fn no_retry_while_the_link_is_full_or_the_receiver_says_no() {
+        let start = Instant::now();
+        let later = start + HOLD * 2;
+        let mut link = Link::default();
+        link.update(told(5000), HOLD, start);
+        link.update(told(200), HOLD, start);
+        assert_eq!(link.update(told(200), HOLD, later), Some(Fit::Audio));
+        let mut link = Link::default();
+        link.update(idle(5000), HOLD, start);
+        link.update(full(200), HOLD, start);
+        assert_eq!(link.update(full(200), HOLD, later), Some(Fit::Audio));
+        assert_eq!(link.update(idle(200), HOLD, later), Some(Fit::High));
+    }
+
+    #[test]
+    fn a_link_is_full_only_when_it_was_asked_to_carry_its_estimate_and_shows_it() {
+        let lost = Some(0.2);
+        let queue = Some(Duration::from_millis(300));
+        // A still screen, however low the estimate, or lost packets on a lossy link.
+        assert!(!congested(50, 50, Some(250), lost, queue));
+        // Sent all it could, and nothing shows.
+        assert!(!congested(100, 400, Some(250), Some(0.0), None));
+        let jitter = Some(Duration::from_millis(184));
+        assert!(!congested(100, 400, Some(250), Some(0.03), jitter));
+        assert!(congested(100, 400, Some(250), lost, None));
+        assert!(congested(100, 400, Some(250), None, queue));
+        assert!(!congested(100, 400, None, lost, queue), "no estimate");
+    }
+
+    /// A lossy link pins the estimate near the audio. In a real call that read as a full link
+    /// with nothing to take away, and kept a viewer's share off it.
+    #[test]
+    fn audio_alone_never_shows_a_link_is_full() {
+        let queue = Some(Duration::from_millis(300));
+        assert!(!congested(85, 0, Some(78), Some(0.2), queue));
+        assert!(
+            !congested(85, 8, Some(78), Some(0.2), queue),
+            "a still screen"
         );
     }
 
     #[test]
+    fn the_resume_probe_reaches_resume_above_the_audio() {
+        assert_eq!(resume_probe_kbps(0), 700);
+        for audio in [0, 49, 50, 128, 304, 1000] {
+            let spare = resume_probe_kbps(audio) - audio;
+            assert_eq!(
+                Fit::of(spare, Fit::Audio),
+                Fit::Low,
+                "{audio} kb/s of audio"
+            );
+        }
+        // Audio wobbles from one second to the next. The target need not.
+        assert_eq!(resume_probe_kbps(301), resume_probe_kbps(304));
+    }
+
+    #[test]
+    fn the_layer_follows_what_fits() {
+        let high = Quality::High;
+        assert_eq!(pick_layer(None, high, high), Some(Layer::Low));
+        assert_eq!(pick_layer(Some(Fit::Audio), high, high), None);
+        assert_eq!(pick_layer(Some(Fit::Low), high, high), Some(Layer::Low));
+        assert_eq!(pick_layer(Some(Fit::Share), high, high), Some(Layer::Low));
+        assert_eq!(pick_layer(Some(Fit::High), high, high), Some(Layer::High));
+    }
+
+    #[test]
     fn quality_and_the_budget_cap_the_layer() {
-        let lots = Some(10_000);
+        let lots = Some(Fit::High);
         assert_eq!(
-            pick_layer(None, lots, Quality::Low, Quality::High),
+            pick_layer(lots, Quality::Low, Quality::High),
             Some(Layer::Low)
         );
-        assert_eq!(pick_layer(None, lots, Quality::Off, Quality::High), None);
+        assert_eq!(pick_layer(lots, Quality::Off, Quality::High), None);
         assert_eq!(
-            pick_layer(None, lots, Quality::High, Quality::Low),
+            pick_layer(lots, Quality::High, Quality::Low),
             Some(Layer::Low)
         );
-        assert_eq!(pick_layer(None, lots, Quality::High, Quality::Off), None);
+        assert_eq!(pick_layer(lots, Quality::High, Quality::Off), None);
     }
 
     fn camera(budget: Option<u32>, audio: u64, viewers: u64) -> Quality {

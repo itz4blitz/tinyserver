@@ -1,9 +1,23 @@
 //! Who is in which room's call. Memory only; a restart ends every call.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::time::{Duration, Instant};
+
+/// One signed-in device: a digest of its session token. A person's phone and desktop differ,
+/// and the same device stays the same across sockets.
+pub(crate) type Session = [u8; 32];
+
+pub(crate) fn session_of(token: &str) -> Session {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// `call.e2ee` frames kept for a seat whose socket closed, to hand to the next one. Commits are
+/// few in a grace; `call.join` and `call.leave` are limited per socket.
+const HELD: usize = 32;
 
 /// Why someone left a call. Sent as `call.left` `reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,11 +149,28 @@ pub(crate) struct Moderation {
     pub hushed: bool,
 }
 
+/// What a device gets back with its seat.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Regained {
+    pub call_id: Option<String>,
+    /// `call.e2ee` frames that came while no socket held the seat, in order. The seat keeps them
+    /// until `delivered`, so a socket that fails on the way hands them to the next one.
+    pub frames: Vec<Arc<str>>,
+}
+
 /// Where a person sits. `conn` is the socket that joined; `None` once it closed.
 struct Seat {
     room_id: String,
     conn: Option<u64>,
     epoch: u64,
+    /// The device that joined. `None` until `set_session`.
+    session: Option<Session>,
+    /// `call.e2ee` frames for the next socket. A member who misses a commit cannot follow the
+    /// group, so these are not dropped as other frames for a closed socket are.
+    held: Vec<Arc<str>>,
+    /// The device's new socket is waiting to hear whether `conn` is alive. What goes to `conn`
+    /// meanwhile is kept in `held` too, in case it is not.
+    contested: bool,
     /// Their SFU participant. `None` for a join without media.
     call_id: Option<String>,
     muted: bool,
@@ -240,6 +271,8 @@ impl Calls {
                 seat.conn = Some(conn);
                 seat.call_id = call_id;
                 seat.access = access;
+                seat.held.clear();
+                seat.contested = false;
                 if seat.e2ee != e2ee {
                     seat.e2ee = e2ee;
                     return Ok(vec![self.state(user_id)]);
@@ -261,6 +294,9 @@ impl Calls {
                 room_id: room_id.to_string(),
                 conn: Some(conn),
                 epoch: self.epoch,
+                session: None,
+                held: Vec::new(),
+                contested: false,
                 call_id,
                 muted: false,
                 deafened: false,
@@ -468,6 +504,84 @@ impl Calls {
         Some(seat.epoch)
     }
 
+    /// Records which device holds `user_id`'s seat.
+    pub fn set_session(&mut self, user_id: &str, session: Session) {
+        if let Some(seat) = self.seats.get_mut(user_id) {
+            seat.session = Some(session);
+        }
+    }
+
+    /// Whether `session` is the device in `user_id`'s seat.
+    pub fn seated(&self, user_id: &str, session: Session) -> bool {
+        self.seats
+            .get(user_id)
+            .is_some_and(|seat| seat.session == Some(session))
+    }
+
+    /// Socket `conn`, holding `user_id`'s seat, was asked to prove it is alive.
+    pub fn contest(&mut self, user_id: &str) {
+        if let Some(seat) = self.seats.get_mut(user_id) {
+            seat.contested = true;
+        }
+    }
+
+    /// Socket `from` proved it, and keeps the seat with everything it was sent meanwhile.
+    pub fn uncontest(&mut self, user_id: &str, from: u64) {
+        if let Some(seat) = self.seats.get_mut(user_id) {
+            seat.contested = false;
+            if seat.conn == Some(from) {
+                seat.held.clear();
+            }
+        }
+    }
+
+    /// Moves the seat to `conn`, the device's new socket, if `session` holds it and no socket
+    /// does, or only `from`, which did not prove it is alive. A blip on the live socket leaves
+    /// healthy media alone this way. Any other device takes the seat only with `call.join`.
+    pub fn regain(
+        &mut self,
+        user_id: &str,
+        session: Session,
+        conn: u64,
+        from: Option<u64>,
+    ) -> Option<Regained> {
+        let seat = self.seats.get_mut(user_id)?;
+        if seat.session != Some(session) || (seat.conn.is_some() && seat.conn != from) {
+            return None;
+        }
+        seat.conn = Some(conn);
+        seat.contested = false;
+        Some(Regained {
+            call_id: seat.call_id.clone(),
+            frames: seat.held.clone(),
+        })
+    }
+
+    /// Socket `conn` sent what `regain` gave it.
+    pub fn delivered(&mut self, user_id: &str, conn: u64) {
+        if let Some(seat) = self.seats.get_mut(user_id) {
+            if seat.conn == Some(conn) {
+                seat.held.clear();
+            }
+        }
+    }
+
+    /// Keeps `frame` if no socket holds `user_id`'s seat, or while its socket is in doubt. True
+    /// if it should not be sent now: false if a socket should have it, or they have no seat.
+    pub fn hold(&mut self, user_id: &str, frame: &Arc<str>) -> bool {
+        let Some(seat) = self
+            .seats
+            .get_mut(user_id)
+            .filter(|seat| seat.conn.is_none() || seat.contested)
+        else {
+            return false;
+        };
+        if seat.held.len() < HELD {
+            seat.held.push(Arc::clone(frame));
+        }
+        seat.conn.is_none()
+    }
+
     /// Leaves if the seat is still the one `orphan` left, with no socket rejoined since.
     pub fn expire(&mut self, user_id: &str, epoch: u64) -> Option<Change> {
         let seat = self.seats.get(user_id)?;
@@ -568,6 +682,8 @@ impl Moves {
 #[cfg(test)]
 mod tests {
     use super::{Access, Calls, Change, Moderation, Moves, Participant, Reason, Refused};
+    use super::{Regained, HELD};
+    use std::sync::Arc;
     use std::time::Duration;
 
     const FREE: Access = Access {
@@ -623,6 +739,144 @@ mod tests {
         );
         assert_eq!(calls.room_of("u"), Some("b"));
         assert_eq!(calls.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn the_same_session_regains_a_seat_and_stops_its_expiry() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        let epoch = calls.orphan("u", 1).expect("seat held by 1");
+        assert_eq!(calls.regain("u", [2; 32], 2, None), None, "another device");
+        assert_eq!(calls.conn_of("u"), None);
+        assert_eq!(
+            calls.regain("u", [1; 32], 3, None),
+            Some(Regained {
+                call_id: None,
+                frames: Vec::new()
+            })
+        );
+        assert_eq!(calls.conn_of("u"), Some(3));
+        assert_eq!(calls.expire("u", epoch), None);
+        assert_eq!(calls.room_of("u"), Some("a"));
+    }
+
+    #[test]
+    fn a_socket_still_up_loses_the_seat_only_to_a_claim_naming_it() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        assert_eq!(calls.regain("u", [1; 32], 2, None), None, "socket 1 is up");
+        assert_eq!(
+            calls.regain("u", [1; 32], 2, Some(9)),
+            None,
+            "not socket 9's"
+        );
+        assert_eq!(calls.conn_of("u"), Some(1));
+        assert!(calls.regain("u", [1; 32], 2, Some(1)).is_some());
+        assert_eq!(calls.conn_of("u"), Some(2));
+        assert_eq!(calls.regain("u", [1; 32], 3, Some(1)), None, "a late claim");
+        assert_eq!(calls.conn_of("u"), Some(2));
+    }
+
+    #[test]
+    fn held_frames_outlive_a_socket_that_fails_before_sending_them() {
+        let mut calls = Calls::default();
+        let frame: Arc<str> = Arc::from("frame");
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        calls.orphan("u", 1);
+        assert!(calls.hold("u", &frame));
+
+        // Socket 2 got them and died before it could send.
+        let first = calls
+            .regain("u", [1; 32], 2, None)
+            .expect("the same device");
+        assert_eq!(first.frames.len(), 1);
+        calls.orphan("u", 2);
+        assert!(calls.hold("u", &frame), "and more came");
+
+        let second = calls
+            .regain("u", [1; 32], 3, None)
+            .expect("the same device");
+        assert_eq!(second.frames.len(), 2);
+        calls.delivered("u", 2);
+        assert_eq!(
+            calls
+                .regain("u", [1; 32], 4, Some(3))
+                .map(|got| got.frames.len()),
+            Some(2),
+            "a stale socket clears nothing"
+        );
+        calls.delivered("u", 4);
+        calls.orphan("u", 4);
+        let last = calls
+            .regain("u", [1; 32], 5, None)
+            .expect("the same device");
+        assert!(last.frames.is_empty());
+    }
+
+    #[test]
+    fn frames_sent_while_a_socket_is_in_doubt_are_kept_for_whoever_wins() {
+        let mut calls = Calls::default();
+        let frame: Arc<str> = Arc::from("frame");
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+
+        calls.contest("u");
+        assert!(!calls.hold("u", &frame), "socket 1 gets it as well");
+        calls.uncontest("u", 1);
+        assert!(!calls.hold("u", &frame));
+        calls.contest("u");
+        calls.uncontest("u", 1);
+
+        calls.contest("u");
+        assert!(!calls.hold("u", &frame));
+        let regained = calls.regain("u", [1; 32], 2, Some(1)).expect("taken");
+        assert_eq!(regained.frames.len(), 1);
+        assert!(!calls.hold("u", &frame), "no longer in doubt");
+    }
+
+    #[test]
+    fn a_seat_with_no_session_is_not_regained() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        assert_eq!(calls.regain("u", [1; 32], 2, None), None);
+        assert_eq!(calls.conn_of("u"), Some(1));
+    }
+
+    #[test]
+    fn frames_for_a_closed_socket_wait_for_the_next_one_up_to_a_cap() {
+        let mut calls = Calls::default();
+        let frame: Arc<str> = Arc::from("frame");
+        assert!(!calls.hold("u", &frame), "no seat");
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        assert!(!calls.hold("u", &frame), "the socket is up");
+        calls.orphan("u", 1);
+        for _ in 0..HELD + 1 {
+            assert!(calls.hold("u", &frame));
+        }
+        let regained = calls
+            .regain("u", [1; 32], 2, None)
+            .expect("the same device");
+        assert_eq!(regained.frames.len(), HELD);
+        assert!(!calls.hold("u", &frame), "the socket is back");
+    }
+
+    #[test]
+    fn a_join_drops_what_was_held_for_the_old_media() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        calls.set_session("u", [1; 32]);
+        calls.orphan("u", 1);
+        assert!(calls.hold("u", &Arc::from("frame")));
+        assert!(join(&mut calls, "u", "a", 2).is_ok());
+        calls.orphan("u", 2);
+        let regained = calls
+            .regain("u", [1; 32], 3, None)
+            .expect("the same device");
+        assert!(regained.frames.is_empty());
     }
 
     #[test]

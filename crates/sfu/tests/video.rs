@@ -118,6 +118,55 @@ async fn a_listener_on_a_slow_link_gets_the_low_layer() {
 }
 
 #[tokio::test]
+async fn a_link_too_small_for_video_pauses_it_and_it_resumes_on_a_keyframe() {
+    let mut sfu = start(config());
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    b.running.remb(Some(1000));
+    sfu.camera(&a, true).await;
+    sfu.video_for(&b.call_id, Some("a")).await;
+    sees(&b, b'A').await;
+
+    b.running.remb(Some(200));
+    sfu.video_for(&b.call_id, None).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let paused = seen_over(&b, Duration::from_millis(500)).await;
+    assert!(paused.is_empty(), "video on a starved link: {paused:?}");
+
+    // Enough to stay on, not to come back.
+    b.running.remb(Some(400));
+    let held = seen_over(&b, Duration::from_millis(1500)).await;
+    assert!(held.is_empty(), "video below the resume point: {held:?}");
+
+    b.running.remb(Some(1000));
+    sfu.video_for(&b.call_id, Some("a")).await;
+    assert!(sees(&b, b'A').await[0].keyframe);
+}
+
+/// A publisher with no `l`, and a listener whose link last had room for `l`. Nothing can show
+/// until the link is measured again, so it has to be, or the slot stays empty for good.
+#[tokio::test]
+async fn a_listener_held_on_l_finds_its_way_to_a_publisher_with_only_h() {
+    let mut sfu = start(config());
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    a.running.single_layer();
+    sfu.camera(&a, true).await;
+    settles_on(&b, b'A', b'h').await;
+
+    b.running.remb(Some(600));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    sfu.camera(&a, false).await;
+    sfu.video_for(&b.call_id, None).await;
+    b.running.remb(Some(5000));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    b.running.take_video();
+
+    sfu.camera(&a, true).await;
+    settles_on(&b, b'A', b'h').await;
+}
+
+#[tokio::test]
 async fn call_quality_caps_the_layer_or_turns_video_off() {
     let mut sfu = start(config());
     let a = join(&mut sfu, "r", "a", b'A').await;

@@ -152,6 +152,21 @@ Every member in a call sees `TINYSERVER_PUBLIC_IP` in the SDP answer. The tunnel
 
 Joining the `media` network gives the server a route out, which it did not have. It makes no outbound connections except to a sign-in provider outside the compose file, when one is configured; an owner who wants that enforced can add a `DOCKER-USER` rule that allows only replies.
 
+### On a VPS
+
+A small VPS drops call packets long before its CPU is busy, because the kernel's socket buffer limits are low and the provider's line is shared. Two settings matter.
+
+The media socket asks for 4 MiB of buffer each way. Linux caps that at `net.core.rmem_max` and `net.core.wmem_max`, about 200 KiB on a stock kernel, without an error. These are host settings; a container cannot change them. On the host:
+
+```sh
+printf 'net.core.rmem_max=4194304\nnet.core.wmem_max=4194304\n' | sudo tee /etc/sysctl.d/90-tinyserver-media.conf
+sudo sysctl --system
+```
+
+Restart tinyserver afterwards. Its log says `media socket buffers` with what it got; Linux reports double the usable size, so about 8388608 each way means the setting took.
+
+Set `TINYSERVER_MEDIA_EGRESS_KBPS` to a little under what the plan really sustains, not its burst figure. A VPS sold as "1 Gb/s" may hold far less for long, or meter it. Without a budget, nothing stops a large room sending more than the line carries, and everyone's audio suffers along with the video. Once a minute during a call the log has a `media counters` line: `send_dropped` above zero means the host could not keep up, and `longest_turn_ms` above about 20 means the media thread was short of CPU.
+
 TCP streams are capped at 256 in all and 16 from one address. One that sends no STUN for a call within 5 s, or nothing at all for 30 s, is closed. A relay mode for hosts that cannot open a port comes in a later release.
 
 ## Without Cloudflare

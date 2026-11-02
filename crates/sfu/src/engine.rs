@@ -20,20 +20,22 @@ use std::time::{Duration, Instant};
 use mio::event::Event as Ready;
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
+use socket2::SockRef;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::SdpOffer;
 use str0m::config::{CryptoProvider, DtlsCert};
 use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaData, MediaKind, MediaTime};
-use str0m::media::{Mid, Rid};
+use str0m::media::{Mid, Pt, Rid};
 use str0m::net::{DatagramRecv, Protocol, Receive, TcpType};
 use str0m::{Candidate, Event as RtcEvent, Input, Output, Rtc, RtcConfig};
 use tokio::sync::mpsc as async_mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::limit::Bucket;
 use crate::room::{Announced, Slots, Speech};
 use crate::sdp;
 use crate::tcp::{Conn, Readout};
-use crate::video::{self, Ceiling, Floor, Layer, Quality, Rebase};
+use crate::video::{self, Ceiling, Fit, Floor, Layer, Link, Quality, Reading, Rebase};
 use crate::{Answer, Command, Config, Event, Lost, Refused, Reply, Slot, VideoKind, VideoSlot};
 
 const SOCKET: Token = Token(0);
@@ -41,12 +43,20 @@ const WAKE: Token = Token(1);
 const LISTENER: Token = Token(2);
 /// TCP streams take tokens from here up.
 const FIRST_STREAM: usize = 3;
+/// Datagrams read from the socket per turn, so TCP streams, commands and timeouts get a say.
+const READ_BATCH: usize = 64;
 /// Bytes read from one TCP stream per turn of the loop, so one cannot starve the rest.
 const STREAM_READ: usize = 64 * 1024;
-/// Port 0 picks a UDP port, and TCP may already hold that number. Tries before giving up.
-const BIND_TRIES: usize = 16;
+/// Port 0 picks a UDP port, and TCP may already hold that number, or on Windows have reserved
+/// a run of ports around it. Tries before giving up.
+const BIND_TRIES: usize = 256;
 /// The loop wakes at least this often.
 const TICK: Duration = Duration::from_millis(50);
+/// What the UDP socket asks the kernel to buffer each way. Enough for a burst of keyframes to
+/// everyone without a drop. Linux silently caps it at `net.core.rmem_max` and `wmem_max`.
+const SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+/// What IP, UDP, RTP and SRTP add to a forwarded audio frame, in bytes.
+const AUDIO_HEADERS: u64 = 60;
 /// Larger than any datagram str0m sends or accepts.
 const DATAGRAM: usize = 2000;
 /// Source addresses with a packet budget. A new source past this is dropped.
@@ -54,8 +64,15 @@ const SOURCES: usize = 4096;
 /// A source silent this long loses its budget entry.
 const SOURCE_IDLE: Duration = Duration::from_secs(10);
 const LOAD_EVERY: Duration = Duration::from_secs(5);
+/// How often the counters are logged while anyone is in a call.
+const REPORT_EVERY: Duration = Duration::from_secs(60);
+/// Seconds of `audio_kbps` a publisher may run ahead of it, for a burst after a stall.
+const AUDIO_BURST: u32 = 2;
 /// Video slots are planned again at least this often.
 const PLAN_EVERY: Duration = Duration::from_millis(50);
+/// Who is speaking and which TCP streams expired are looked at this often. They scan every
+/// room and stream, and the loop turns thousands of times a second under load.
+const SCAN_EVERY: Duration = Duration::from_millis(50);
 
 type PeerId = u64;
 /// One layer of one publisher's camera, or their share.
@@ -72,6 +89,8 @@ struct Inbound {
     /// A frame was dropped over budget. Nothing more is forwarded until a keyframe fits.
     broken: bool,
     asked: Option<Instant>,
+    /// The last keyframe that arrived, forwarded or not.
+    keyframe: Option<Instant>,
 }
 
 impl Inbound {
@@ -84,6 +103,7 @@ impl Inbound {
             seen: None,
             broken: false,
             asked: None,
+            keyframe: None,
         }
     }
 
@@ -98,6 +118,36 @@ impl Inbound {
         self.seen
             .is_some_and(|at| now.saturating_duration_since(at) < video::STALE)
     }
+
+    /// Whether a frame of `size` bytes goes on. Over budget the layer breaks. A broken layer
+    /// spends nothing on frames that cannot pass, so the budget fills for the next keyframe.
+    fn admit(&mut self, keyframe: bool, size: u32, now: Instant) -> bool {
+        if keyframe {
+            self.keyframe = Some(now);
+        }
+        if self.broken && !keyframe {
+            return false;
+        }
+        let fits = self.budget.take(size, now);
+        self.broken = !fits;
+        if fits {
+            self.seen = Some(now);
+        }
+        fits
+    }
+
+    /// Whether a keyframe request may go out now. Not right after a keyframe, which the asker
+    /// is about to get, and less often while the layer is broken.
+    fn may_ask(&self, now: Instant) -> bool {
+        let every = if self.broken {
+            video::KEYFRAME_BROKEN_EVERY
+        } else {
+            video::KEYFRAME_EVERY
+        };
+        let since =
+            |at: Option<Instant>, gap| at.is_some_and(|at| now.saturating_duration_since(at) < gap);
+        self.arrived && !since(self.asked, every) && !since(self.keyframe, video::KEYFRAME_EVERY)
+    }
 }
 
 /// A listener's one video receive m-line.
@@ -110,6 +160,8 @@ struct Screen {
     rebase: Rebase<Source>,
     /// The bitrate the estimator was last told to probe for, in kb/s.
     probing: Option<u64>,
+    /// What this listener's link has room for.
+    link: Link,
 }
 
 struct Peer {
@@ -119,9 +171,9 @@ struct Peer {
     rtc: Rtc,
     /// The client's microphone m-line.
     publish: Option<Mid>,
+    /// The payload type audio goes to them on, for putting it first on a TCP stream.
+    audio_pt: Option<Pt>,
     slots: Slots<Mid, PeerId>,
-    /// Receive m-lines were added since the slots were last filled.
-    new_slots: bool,
     /// The last slot map sent for this listener.
     told: Vec<Slot>,
     connected: bool,
@@ -154,6 +206,22 @@ struct Peer {
     /// TWCC estimator, and the last REMB the client sent.
     twcc: Option<u64>,
     remb: Option<u64>,
+    /// Audio sent to this listener since it was last measured, with headers, in bytes.
+    audio_sent: u64,
+    /// That audio as a rate, in kb/s, measured every second. It comes off the estimate.
+    audio_kbps: u64,
+    /// The same for video, with headers: what the link was asked to carry.
+    video_sent: u64,
+    video_kbps: u64,
+    /// The share of what was sent to this listener that TWCC says was lost in the last second.
+    loss: Option<f32>,
+    /// The latest round trip, and the lowest yet: the difference is a queue on the path.
+    rtt: Option<Duration>,
+    rtt_least: Option<Duration>,
+    /// The link showed it is full in the last second.
+    full: bool,
+    /// It did in the second before that too.
+    congested: bool,
     told_video: Option<VideoSlot>,
     timeout: Instant,
     lost: Option<Lost>,
@@ -178,13 +246,6 @@ impl Peer {
         match layer {
             Layer::Share => self.share_live(),
             Layer::High | Layer::Low => self.camera_live(),
-        }
-    }
-
-    fn estimate(&self) -> Option<u64> {
-        match (self.twcc, self.remb) {
-            (Some(twcc), Some(remb)) => Some(twcc.min(remb)),
-            (twcc, remb) => twcc.or(remb),
         }
     }
 }
@@ -233,16 +294,20 @@ struct Tcp {
 }
 
 impl Tcp {
-    /// Frames `packet` onto the stream from `to`. Dropped if there is none or it is backed up.
-    fn send(&mut self, to: SocketAddr, packet: &[u8]) {
+    /// Frames `packet` onto the stream from `to`, ahead of waiting video if `urgent`. Dropped
+    /// if there is none or it is backed up, and then false.
+    fn send(&mut self, to: SocketAddr, packet: &[u8], urgent: bool) -> bool {
         let Some(token) = self.by_peer.get(&to).copied() else {
-            return;
+            return false;
         };
-        if let Some(stream) = self.streams.get_mut(&token) {
-            if stream.conn.queue(packet) {
-                self.flush(token);
-            }
+        let queued = self
+            .streams
+            .get_mut(&token)
+            .is_some_and(|stream| stream.conn.queue(packet, urgent));
+        if queued {
+            self.flush(token);
         }
+        queued
     }
 
     /// Writes the backlog, and watches for writable only while some is left.
@@ -284,27 +349,91 @@ impl Tcp {
     }
 }
 
+/// Events on their way to the API. The media thread must not wait for it, so what the queue
+/// cannot take now stays here in order, and `tick` tries again. Joins and leaves are few, because
+/// the API limits them. Slot maps follow the floor and every layer switch, so only each call's
+/// latest waits: nothing about a call comes after its `Left`, and the rest keep their order.
+struct Outbox {
+    sender: async_mpsc::Sender<Event>,
+    waiting: VecDeque<Event>,
+}
+
+impl Outbox {
+    fn new(sender: async_mpsc::Sender<Event>) -> Self {
+        Self {
+            sender,
+            waiting: VecDeque::new(),
+        }
+    }
+
+    /// An event the API must see.
+    fn tell(&mut self, event: Event) {
+        match self.waiting_slots(&event) {
+            Some(waiting) => *waiting = event,
+            None => self.waiting.push_back(event),
+        }
+        self.flush();
+    }
+
+    /// The slot map already waiting for the same call as `event`, if that is one too.
+    fn waiting_slots(&mut self, event: &Event) -> Option<&mut Event> {
+        let Event::Slots { call_id, .. } = event else {
+            return None;
+        };
+        self.waiting.iter_mut().find(
+            |waiting| matches!(waiting, Event::Slots { call_id: other, .. } if other == call_id),
+        )
+    }
+
+    /// An event that may be dropped when the queue is full.
+    fn hint(&self, event: Event) {
+        let _ = self.sender.try_send(event);
+    }
+
+    /// Hands the API what it has room for.
+    fn flush(&mut self) {
+        while let Some(event) = self.waiting.pop_front() {
+            match self.sender.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => {
+                    self.waiting.push_front(event);
+                    return;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    self.waiting.clear();
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Where a drained `Rtc` puts what it produced.
 struct Sink<'a> {
     socket: &'a UdpSocket,
     tcp: &'a mut Tcp,
-    events: &'a async_mpsc::Sender<Event>,
+    events: &'a mut Outbox,
     egress: &'a mut u64,
     forward: &'a mut VecDeque<(PeerId, MediaData)>,
     /// Listeners who asked for a keyframe on their video slot.
     asks: &'a mut Vec<PeerId>,
+    /// Participants with new receive m-lines.
+    fresh: &'a mut Vec<PeerId>,
+    counts: &'a mut Counts,
 }
 
 pub(crate) struct Engine {
     config: Config,
     poll: Poll,
     socket: UdpSocket,
+    /// The last read stopped at `READ_BATCH` with datagrams perhaps still waiting.
+    socket_unread: bool,
     listener: TcpListener,
     tcp: Tcp,
     public: SocketAddr,
     lan: Option<SocketAddr>,
     inbox: Receiver<Command>,
-    events: async_mpsc::Sender<Event>,
+    events: Outbox,
     alive: Arc<AtomicBool>,
     crypto: Arc<CryptoProvider>,
     cert: DtlsCert,
@@ -315,14 +444,36 @@ pub(crate) struct Engine {
     rooms: HashMap<String, Room>,
     forward: VecDeque<(PeerId, MediaData)>,
     asks: Vec<PeerId>,
+    /// Participants whose `Rtc` reported new receive m-lines since the slots were last filled.
+    fresh: Vec<PeerId>,
     /// Something changed that moves video slots; plan them at the next tick.
     replan: bool,
     planned_at: Instant,
     next_id: u64,
     ids: RandomState,
     egress: u64,
+    counts: Counts,
     load_at: Instant,
+    reported_at: Instant,
     swept_at: Instant,
+    /// The last look at who is speaking and which streams expired.
+    scanned_at: Instant,
+}
+
+/// What the media thread dropped or asked for since the last time it reported. Totals only:
+/// nothing here names a person or a call.
+#[derive(Debug, Default)]
+struct Counts {
+    /// The longest turn of the loop, from waking to going back to wait.
+    longest_turn: Duration,
+    /// Audio frames over a publisher's budget.
+    audio_dropped: u64,
+    /// Video frames over a layer's budget, or waiting for a keyframe after one.
+    video_dropped: u64,
+    /// Keyframe requests sent to publishers.
+    keyframe_asks: u64,
+    /// Packets the socket or a TCP stream had no room for.
+    send_dropped: u64,
 }
 
 /// Marks the thread stopped however it ends, a panic included.
@@ -367,10 +518,11 @@ impl Engine {
             config,
             poll,
             socket,
+            socket_unread: false,
             listener,
             tcp,
             inbox,
-            events,
+            events: Outbox::new(events),
             alive,
             crypto,
             cert,
@@ -381,13 +533,17 @@ impl Engine {
             rooms: HashMap::new(),
             forward: VecDeque::new(),
             asks: Vec::new(),
+            fresh: Vec::new(),
             replan: false,
             planned_at: now,
             next_id: 0,
             ids: RandomState::new(),
             egress: 0,
+            counts: Counts::default(),
             load_at: now,
+            reported_at: now,
             swept_at: now,
+            scanned_at: now,
         };
         Ok((engine, waker))
     }
@@ -402,7 +558,7 @@ impl Engine {
         let mut events = Events::with_capacity(256);
         let mut buf = vec![0; DATAGRAM];
         loop {
-            let wait = if self.tcp.unread.is_empty() {
+            let wait = if self.tcp.unread.is_empty() && !self.socket_unread {
                 self.deadline()
                     .saturating_duration_since(Instant::now())
                     .min(TICK)
@@ -415,15 +571,17 @@ impl Engine {
                     return;
                 }
             }
+            let woke = Instant::now();
             if !self.commands() {
                 tracing::info!("media stopped");
                 return;
             }
             let ready: Vec<(Token, bool, bool)> = events.iter().map(readiness).collect();
             let mut unread = std::mem::take(&mut self.tcp.unread);
+            let mut socket_ready = std::mem::take(&mut self.socket_unread);
             for (token, readable, writable) in ready {
                 match token {
-                    SOCKET => self.read(&mut buf),
+                    SOCKET => socket_ready = true,
                     WAKE => {}
                     LISTENER => self.accept(Instant::now(), &mut unread),
                     token => {
@@ -436,10 +594,15 @@ impl Engine {
                     }
                 }
             }
+            if socket_ready {
+                self.socket_unread = self.read(&mut buf);
+            }
             for token in unread {
                 self.read_stream(token, Instant::now());
             }
             self.tick(Instant::now());
+            let turn = woke.elapsed();
+            self.counts.longest_turn = self.counts.longest_turn.max(turn);
         }
     }
 
@@ -691,15 +854,14 @@ impl Engine {
         self.next_id += 1;
         let id = self.next_id;
         let call_id = self.call_id();
-        let rate = self.config.audio_kbps.saturating_mul(1000) / 8;
         let peer = Peer {
             call_id: call_id.clone(),
             room_id: room_id.clone(),
             user_id,
             rtc,
             publish: None,
+            audio_pt: None,
             slots: Slots::new(),
-            new_slots: false,
             told: Vec::new(),
             connected: false,
             joined_at: now,
@@ -709,7 +871,7 @@ impl Engine {
             silenced: false,
             hushed: false,
             speech: Speech::new(),
-            audio: Bucket::new(rate, rate, now),
+            audio: audio_budget(self.config.audio_kbps, now),
             camera: None,
             camera_on: false,
             share: None,
@@ -724,6 +886,15 @@ impl Engine {
             quality: Quality::High,
             twcc: None,
             remb: None,
+            audio_sent: 0,
+            audio_kbps: 0,
+            video_sent: 0,
+            video_kbps: 0,
+            loss: None,
+            rtt: None,
+            rtt_least: None,
+            full: false,
+            congested: false,
             told_video: None,
             timeout: now,
             lost: None,
@@ -918,13 +1089,10 @@ impl Engine {
         self.replan = true;
         if let Some(lost) = lost {
             tracing::info!(call_id = %peer.call_id, ?lost, "media lost");
-            tell(
-                &self.events,
-                Event::Left {
-                    call_id: peer.call_id.clone(),
-                    lost,
-                },
-            );
+            self.events.tell(Event::Left {
+                call_id: peer.call_id.clone(),
+                lost,
+            });
         }
         let members = match self.rooms.get_mut(&peer.room_id) {
             Some(room) => {
@@ -1009,14 +1177,11 @@ impl Engine {
             peer.told.clone_from(&audio);
             peer.told_video.clone_from(&video);
         }
-        tell(
-            &self.events,
-            Event::Slots {
-                call_id,
-                audio,
-                video,
-            },
-        );
+        self.events.tell(Event::Slots {
+            call_id,
+            audio,
+            video,
+        });
     }
 
     fn peer_mut(&mut self, call_id: &str) -> Option<&mut Peer> {
@@ -1036,9 +1201,11 @@ impl Engine {
         }
     }
 
-    /// Reads every datagram waiting on the socket.
-    fn read(&mut self, buf: &mut [u8]) {
-        loop {
+    /// Reads the datagrams waiting on the socket, up to `READ_BATCH`. True if it stopped there
+    /// with more perhaps waiting: readiness is edge-triggered, so only reading to `WouldBlock`
+    /// earns another event, and `run` must come back without one.
+    fn read(&mut self, buf: &mut [u8]) -> bool {
+        for _ in 0..READ_BATCH {
             match self.socket.recv_from(buf) {
                 Ok((n, source)) => {
                     let now = Instant::now();
@@ -1046,18 +1213,25 @@ impl Engine {
                         self.receive(packet, Protocol::Udp, source, now);
                     }
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return false,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                // An ICMP error from an earlier send. Not this read's problem.
-                Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
+                // An ICMP error from an earlier send, which Windows reports as a reset. Not this
+                // read's problem, and stopping here would lose the socket's readiness.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+                    ) =>
+                {
                     tracing::debug!(reason = "icmp", "media dropped");
                 }
                 Err(error) => {
                     tracing::warn!(%error, "media read failed");
-                    return;
+                    return false;
                 }
             }
         }
+        true
     }
 
     /// One datagram, or one frame from a TCP stream. Over its source's budget, or for
@@ -1118,17 +1292,13 @@ impl Engine {
         Some(id)
     }
 
-    /// Fills the slots of everyone whose `Rtc` reported new receive m-lines.
+    /// Fills the slots of everyone in `fresh`.
     fn settle(&mut self) {
-        let fresh: Vec<PeerId> = self
-            .peers
-            .iter_mut()
-            .filter(|(_, peer)| peer.new_slots)
-            .map(|(id, peer)| {
-                peer.new_slots = false;
-                *id
-            })
-            .collect();
+        if self.fresh.is_empty() {
+            return;
+        }
+        let mut fresh = std::mem::take(&mut self.fresh);
+        fresh.dedup();
         for id in fresh {
             self.reseat(id);
             self.tell_slots(id);
@@ -1137,6 +1307,7 @@ impl Engine {
 
     /// Timeouts, deadlines, speaking, load, and the dead.
     fn tick(&mut self, now: Instant) {
+        self.events.flush();
         let due: Vec<PeerId> = self
             .peers
             .iter()
@@ -1178,29 +1349,90 @@ impl Engine {
             self.remove(id, Some(lost));
         }
 
-        self.speaking(now);
+        let sweep = now.saturating_duration_since(self.scanned_at) >= SCAN_EVERY;
+        if sweep {
+            self.scanned_at = now;
+            self.speaking(now);
+        }
         if self.replan || now.saturating_duration_since(self.planned_at) >= PLAN_EVERY {
             self.plan(now);
         }
-        self.expire_streams(now);
-        if now.saturating_duration_since(self.swept_at) >= Duration::from_secs(1) {
+        if sweep {
+            self.expire_streams(now);
+        }
+        let since = now.saturating_duration_since(self.swept_at);
+        if since >= Duration::from_secs(1) {
             self.swept_at = now;
+            for peer in self.peers.values_mut() {
+                let sent = std::mem::take(&mut peer.audio_sent);
+                peer.audio_kbps = sent.saturating_mul(8) / since.as_millis().max(1) as u64;
+                let sent = std::mem::take(&mut peer.video_sent);
+                peer.video_kbps = sent.saturating_mul(8) / since.as_millis().max(1) as u64;
+                let queue = peer
+                    .rtt
+                    .zip(peer.rtt_least)
+                    .map(|(rtt, least)| rtt.saturating_sub(least));
+                let full = video::congested(
+                    peer.audio_kbps,
+                    peer.video_kbps,
+                    peer.twcc,
+                    peer.loss,
+                    queue,
+                );
+                peer.congested = full && peer.full;
+                peer.full = full;
+                if let Some(screen) = &peer.screen {
+                    tracing::debug!(
+                        call_id = %peer.call_id,
+                        twcc = ?peer.twcc,
+                        remb = ?peer.remb,
+                        audio_kbps = peer.audio_kbps,
+                        video_kbps = peer.video_kbps,
+                        loss = ?peer.loss,
+                        queue_ms = ?queue.map(|queue| queue.as_millis()),
+                        congested = peer.congested,
+                        probing = ?screen.probing,
+                        showing = ?screen.showing.map(|(_, layer)| layer),
+                        wanted = ?screen.wanted.map(|(_, layer)| layer),
+                        fit = ?screen.link.fit(),
+                        "link"
+                    );
+                }
+            }
             self.sources
                 .retain(|_, bucket| now.saturating_duration_since(bucket.used()) < SOURCE_IDLE);
+        }
+        if now.saturating_duration_since(self.reported_at) >= REPORT_EVERY {
+            self.reported_at = now;
+            self.report();
         }
         let since = now.saturating_duration_since(self.load_at);
         if since >= LOAD_EVERY {
             let egress_kbps = self.egress.saturating_mul(8) / since.as_millis().max(1) as u64;
             self.egress = 0;
             self.load_at = now;
-            hint(
-                &self.events,
-                Event::Load {
-                    egress_kbps,
-                    participants: self.peers.len(),
-                },
-            );
+            self.events.hint(Event::Load {
+                egress_kbps,
+                participants: self.peers.len(),
+            });
         }
+    }
+
+    /// Logs the counters while anyone is in a call, and starts them over.
+    fn report(&mut self) {
+        let counts = std::mem::take(&mut self.counts);
+        if self.peers.is_empty() {
+            return;
+        }
+        tracing::info!(
+            peers = self.peers.len(),
+            audio_dropped = counts.audio_dropped,
+            send_dropped = counts.send_dropped,
+            video_dropped = counts.video_dropped,
+            keyframe_asks = counts.keyframe_asks,
+            longest_turn_ms = counts.longest_turn.as_millis() as u64,
+            "media counters"
+        );
     }
 
     /// Closes TCP streams that failed, never verified in time, or went quiet.
@@ -1243,13 +1475,10 @@ impl Engine {
                 .map(|peer| peer.user_id.clone())
                 .collect();
             if let Some(user_ids) = room.announced.due(user_ids, now) {
-                hint(
-                    &self.events,
-                    Event::Speaking {
-                        room_id: room_id.clone(),
-                        user_ids,
-                    },
-                );
+                self.events.hint(Event::Speaking {
+                    room_id: room_id.clone(),
+                    user_ids,
+                });
             }
         }
     }
@@ -1262,10 +1491,12 @@ impl Engine {
         let mut sink = Sink {
             socket: &self.socket,
             tcp: &mut self.tcp,
-            events: &self.events,
+            events: &mut self.events,
             egress: &mut self.egress,
             forward: &mut self.forward,
             asks: &mut self.asks,
+            fresh: &mut self.fresh,
+            counts: &mut self.counts,
         };
         drain(id, peer, &mut sink);
     }
@@ -1294,10 +1525,13 @@ impl Engine {
             publisher.speech.hear(data.ext_vals.audio_level, now);
             let size = u32::try_from(data.data.len()).unwrap_or(u32::MAX);
             if !publisher.audio.take(size, now) {
+                self.counts.audio_dropped += 1;
                 continue;
             }
-            let room_id = publisher.room_id.clone();
-            for listener in self.members(&room_id) {
+            let Some(room) = self.rooms.get(&publisher.room_id) else {
+                continue;
+            };
+            for &listener in &room.members {
                 if listener == origin {
                     continue;
                 }
@@ -1316,21 +1550,24 @@ impl Engine {
                 let Some(pt) = writer.match_params(data.params) else {
                     continue;
                 };
-                if let Err(error) =
-                    writer.write(pt, data.network_time, data.time, data.data.clone())
-                {
+                let written = writer.write(pt, data.network_time, data.time, data.data.clone());
+                peer.audio_pt = Some(pt);
+                peer.audio_sent += u64::from(size) + AUDIO_HEADERS;
+                if let Err(error) = written {
                     tracing::warn!(call_id = %peer.call_id, direction = "audio", reason = crate::rtc_reason(&error), "media failed");
                     peer.rtc.disconnect();
                 }
                 let mut sink = Sink {
                     socket: &self.socket,
                     tcp: &mut self.tcp,
-                    events: &self.events,
+                    events: &mut self.events,
                     egress: &mut self.egress,
                     forward: &mut self.forward,
                     asks: &mut self.asks,
+                    fresh: &mut self.fresh,
+                    counts: &mut self.counts,
                 };
-                drain(listener, peer, &mut sink);
+                release(listener, peer, &mut sink, now);
             }
         }
         for asker in std::mem::take(&mut self.asks) {
@@ -1357,28 +1594,31 @@ impl Engine {
         let inbound = &mut publisher.layers[layer.index()];
         inbound.arrived = true;
         inbound.rid = data.rid;
-        let fits = inbound.budget.take(size, now);
-        if !fits {
-            if !inbound.broken {
+        let was_broken = inbound.broken;
+        let pass = inbound.admit(keyframe, size, now);
+        if !pass {
+            self.counts.video_dropped += 1;
+            if !was_broken {
                 tracing::debug!(call_id = %publisher.call_id, reason = "budget", "media dropped");
             }
-            inbound.broken = true;
         }
-        let pass = fits && (keyframe || !inbound.broken);
-        if pass {
-            inbound.broken = false;
-            inbound.seen = Some(now);
-        }
-        let room_id = publisher.room_id.clone();
         if !pass || !data.contiguous {
             self.ask_keyframe(origin, layer, now);
         }
         if !pass {
             return;
         }
+        let Some(room) = self
+            .peers
+            .get(&origin)
+            .and_then(|publisher| self.rooms.get(&publisher.room_id))
+        else {
+            return;
+        };
         let source = (origin, layer);
         let time = data.time.rebase(Frequency::NINETY_KHZ).numer();
-        for listener in self.members(&room_id) {
+        let mut switched_listeners = Vec::new();
+        for &listener in &room.members {
             if listener == origin {
                 continue;
             }
@@ -1405,6 +1645,7 @@ impl Engine {
                 continue;
             };
             let at = MediaTime::new(out, Frequency::NINETY_KHZ);
+            peer.video_sent += u64::from(size) + AUDIO_HEADERS;
             if let Err(error) = writer.write(pt, data.network_time, at, data.data.clone()) {
                 tracing::warn!(call_id = %peer.call_id, direction = "video", reason = crate::rtc_reason(&error), "media failed");
                 peer.rtc.disconnect();
@@ -1412,20 +1653,25 @@ impl Engine {
             let mut sink = Sink {
                 socket: &self.socket,
                 tcp: &mut self.tcp,
-                events: &self.events,
+                events: &mut self.events,
                 egress: &mut self.egress,
                 forward: &mut self.forward,
                 asks: &mut self.asks,
+                fresh: &mut self.fresh,
+                counts: &mut self.counts,
             };
-            drain(listener, peer, &mut sink);
+            release(listener, peer, &mut sink, now);
             if switched {
-                self.tell_slots(listener);
+                switched_listeners.push(listener);
             }
+        }
+        for listener in switched_listeners {
+            self.tell_slots(listener);
         }
     }
 
-    /// Asks a publisher for a keyframe on one layer, at most every `KEYFRAME_EVERY`. A layer
-    /// that has not sent a frame has no rid to ask on yet.
+    /// Asks a publisher for a keyframe on one layer, as often as `Inbound::may_ask` lets it. A
+    /// layer that has not sent a frame has no rid to ask on yet.
     fn ask_keyframe(&mut self, publisher: PeerId, layer: Layer, now: Instant) {
         let Some(peer) = self.peers.get_mut(&publisher) else {
             return;
@@ -1438,14 +1684,11 @@ impl Engine {
             return;
         };
         let inbound = &mut peer.layers[layer.index()];
-        if !inbound.arrived
-            || inbound
-                .asked
-                .is_some_and(|at| now.saturating_duration_since(at) < video::KEYFRAME_EVERY)
-        {
+        if !inbound.may_ask(now) {
             return;
         }
         inbound.asked = Some(now);
+        self.counts.keyframe_asks += 1;
         let rid = inbound.rid;
         if let Some(mut writer) = peer.rtc.writer(mid) {
             if let Err(error) = writer.request_keyframe(rid, KeyframeRequestKind::Pli) {
@@ -1460,7 +1703,8 @@ impl Engine {
     /// live camera other than the listener, else the first such camera in join order, and its
     /// layer from the listener's estimate, their `call.quality`, and the server's upload
     /// budget. A listener keeps what it shows until the wanted source's keyframe. A deafened
-    /// listener gets nothing.
+    /// listener gets nothing, and neither does one whose link has no room for video beside its
+    /// audio. A share gives way to a camera on a link too small for it.
     fn plan(&mut self, now: Instant) {
         self.replan = false;
         self.planned_at = now;
@@ -1506,6 +1750,21 @@ impl Engine {
     }
 
     fn plan_screen(&mut self, id: PeerId, ceiling: Ceiling, now: Instant) {
+        let hold = self.config.layer_hold;
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return;
+        };
+        let audio = peer.audio_kbps;
+        let reading = Reading {
+            told: peer.remb.map(|remb| remb.saturating_sub(audio)),
+            estimate: peer.twcc.map(|twcc| twcc.saturating_sub(audio)),
+            congested: peer.congested,
+        };
+        let Some(screen) = peer.screen.as_mut() else {
+            return;
+        };
+        let fit = screen.link.update(reading, hold, now);
+        let share_fits = fit.is_none_or(|fit| fit >= Fit::Share);
         let Some(peer) = self.peers.get(&id) else {
             return;
         };
@@ -1524,18 +1783,20 @@ impl Engine {
             .map(|sharer| (sharer, Layer::Share))
             .filter(sends);
         let ceiling_camera = ceiling.camera;
-        let publisher = room.filter(|_| share.is_none()).and_then(|room| {
-            room.floor
-                .recent()
-                .iter()
-                .chain(&room.members)
-                .find(|other| live(other))
-                .copied()
-        });
-        let most = peer.quality.min(ceiling_camera);
-        let current = screen.wanted.map(|(_, layer)| layer);
+        let publisher = room
+            .filter(|_| share.is_none() || !share_fits)
+            .and_then(|room| {
+                room.floor
+                    .recent()
+                    .iter()
+                    .chain(&room.members)
+                    .find(|other| live(other))
+                    .copied()
+            });
+        let allowed = peer.quality.min(ceiling_camera);
+        let most = allowed.min(fit.map_or(Quality::High, Fit::quality));
         let camera = publisher.and_then(|publisher| {
-            let layer = video::pick_layer(current, peer.estimate(), peer.quality, ceiling_camera)?;
+            let layer = video::pick_layer(fit, peer.quality, ceiling_camera)?;
             let layers = &self.peers.get(&publisher)?.layers;
             let fresh = |layer: Layer| layers[layer.index()].fresh(now);
             let other = layer.other();
@@ -1543,17 +1804,24 @@ impl Engine {
                 !fresh(layer) && fresh(other) && (other == Layer::Low || most == Quality::High);
             Some((publisher, if fallback { other } else { layer }))
         });
-        // A share has one layer, so the estimate does not choose it; `off` and the budget may.
+        // A share has one layer: `off` and the budget may withhold it. On a link too small for
+        // it, a camera's `l` is what can still get through.
+        let wants_share = ceiling.share && peer.quality != Quality::Off;
         let wanted = match share {
-            Some(share) => (ceiling.share && peer.quality != Quality::Off).then_some(share),
-            None => camera,
+            Some(share) if share_fits => wants_share.then_some(share),
+            _ => camera,
         };
         let showing = screen
             .showing
             .filter(|source| wanted.is_some() && sends(source));
+        // Probing asks for what would be shown if the link allowed it, or it could never climb.
+        let paused = publisher.is_some() && camera.is_none() && allowed != Quality::Off;
         let probe = match wanted {
             Some((_, Layer::Share)) => video::SHARE_KBPS,
-            Some(_) if most == Quality::High => video::PROBE_KBPS,
+            _ if share.is_some() && wants_share => video::SHARE_KBPS,
+            Some(_) if allowed == Quality::High => video::PROBE_KBPS,
+            None if paused && allowed == Quality::High => video::PROBE_KBPS,
+            None if paused => video::resume_probe_kbps(peer.audio_kbps),
             _ => video::LOW_KBPS,
         };
         let Some(peer) = self.peers.get_mut(&id) else {
@@ -1579,6 +1847,16 @@ impl Engine {
     }
 }
 
+/// Sends what a `write` queued. str0m turns a write into packets only on a timeout, so a
+/// drain alone sends nothing, and the frame would wait for `tick` behind every other read.
+fn release(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>, now: Instant) {
+    if let Err(error) = peer.rtc.handle_input(Input::Timeout(now)) {
+        tracing::warn!(call_id = %peer.call_id, direction = "input", reason = crate::rtc_reason(&error), "media failed");
+        peer.rtc.disconnect();
+    }
+    drain(id, peer, sink);
+}
+
 fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
     loop {
         if !peer.rtc.is_alive() {
@@ -1602,12 +1880,19 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
             Output::Transmit(transmit) => {
                 *sink.egress += transmit.contents.len() as u64;
                 if transmit.proto == Protocol::Tcp {
-                    sink.tcp.send(transmit.destination, &transmit.contents);
+                    let urgent = peer.audio_pt.is_some()
+                        && payload_type(&transmit.contents) == peer.audio_pt;
+                    let sent = sink
+                        .tcp
+                        .send(transmit.destination, &transmit.contents, urgent);
+                    sink.counts.send_dropped += u64::from(!sent);
                 } else if let Err(error) = sink
                     .socket
                     .send_to(&transmit.contents, transmit.destination)
                 {
-                    if error.kind() != ErrorKind::WouldBlock {
+                    if error.kind() == ErrorKind::WouldBlock {
+                        sink.counts.send_dropped += 1;
+                    } else {
                         tracing::warn!(call_id = %peer.call_id, direction = "output", reason = "io", "media failed");
                     }
                 }
@@ -1616,12 +1901,9 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                 RtcEvent::Connected => {
                     peer.connected = true;
                     tracing::info!(call_id = %peer.call_id, "media connected");
-                    tell(
-                        sink.events,
-                        Event::Connected {
-                            call_id: peer.call_id.clone(),
-                        },
-                    );
+                    sink.events.tell(Event::Connected {
+                        call_id: peer.call_id.clone(),
+                    });
                 }
                 RtcEvent::MediaAdded(added) if added.kind == MediaKind::Audio => {
                     match added.direction {
@@ -1630,7 +1912,7 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                         }
                         Direction::SendOnly => {
                             peer.slots.add_mid(added.mid);
-                            peer.new_slots = true;
+                            sink.fresh.push(id);
                         }
                         _ => {}
                     }
@@ -1644,6 +1926,7 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                                 wanted: None,
                                 rebase: Rebase::default(),
                                 probing: None,
+                                link: Link::default(),
                             });
                         }
                         Direction::RecvOnly | Direction::SendRecv | Direction::Inactive
@@ -1668,6 +1951,11 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                     if peer.screen.as_ref().map(|screen| screen.mid) == Some(request.mid) =>
                 {
                     sink.asks.push(id);
+                }
+                RtcEvent::PeerStats(stats) => {
+                    peer.loss = stats.egress_loss_fraction;
+                    peer.rtt = stats.rtt;
+                    peer.rtt_least = peer.rtt_least.min(stats.rtt).or(stats.rtt);
                 }
                 RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
                     peer.twcc = Some(kbps(estimate));
@@ -1696,17 +1984,42 @@ fn bind(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, u16)> {
         let port = udp.local_addr()?.port();
         match std::net::TcpListener::bind(SocketAddr::new(addr.ip(), port)) {
             Ok(tcp) => {
+                request_buffers(&udp);
                 udp.set_nonblocking(true)?;
                 tcp.set_nonblocking(true)?;
                 return Ok((UdpSocket::from_std(udp), TcpListener::from_std(tcp), port));
             }
             Err(error)
                 if addr.port() == 0
-                    && error.kind() == ErrorKind::AddrInUse
+                    && matches!(
+                        error.kind(),
+                        ErrorKind::AddrInUse | ErrorKind::PermissionDenied
+                    )
                     && tries < BIND_TRIES => {}
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Asks for `SOCKET_BUFFER` each way and logs what it got, which is an operator's only sign
+/// of a low cap. Linux reports double what it keeps for payload.
+fn request_buffers(udp: &std::net::UdpSocket) {
+    let socket = SockRef::from(udp);
+    if let Err(error) = socket.set_recv_buffer_size(SOCKET_BUFFER) {
+        tracing::warn!(%error, "media receive buffer not set");
+    }
+    if let Err(error) = socket.set_send_buffer_size(SOCKET_BUFFER) {
+        tracing::warn!(%error, "media send buffer not set");
+    }
+    let receive = socket.recv_buffer_size().unwrap_or_default();
+    let send = socket.send_buffer_size().unwrap_or_default();
+    tracing::info!(receive, send, "media socket buffers");
+}
+
+/// What one publisher's audio may spend.
+fn audio_budget(kbps: u32, now: Instant) -> Bucket {
+    let rate = kbps.saturating_mul(1000) / 8;
+    Bucket::new(rate, rate.saturating_mul(AUDIO_BURST), now)
 }
 
 /// A missing audio packet is released at once. str0m's default holds it until 15 later
@@ -1733,7 +2046,8 @@ pub(crate) fn rtc_config(
             .set_dtls_cert(cert.clone())
             .clear_codecs()
             .enable_opus(true, false)
-            .enable_bwe(bwe_kbps.map(|kbps| Bitrate::kbps(u64::from(kbps)))),
+            .enable_bwe(bwe_kbps.map(|kbps| Bitrate::kbps(u64::from(kbps))))
+            .set_stats_interval(Some(Duration::from_secs(1))),
     );
     config
         .codec_config()
@@ -1772,6 +2086,20 @@ pub(crate) fn candidates(
         .collect()
 }
 
+/// The payload type of an RTP packet that carries media, from the header SRTP leaves in the
+/// clear. RTCP reads as a number below the dynamic range, so it never matches a media type. RFC
+/// 7983 says which is RTP. str0m's probe padding comes on the first m-line it may send on, the
+/// audio one's type included, with no real payload behind it: its padding bit tells it apart,
+/// which str0m sets on no media packet.
+fn payload_type(packet: &[u8]) -> Option<Pt> {
+    match packet {
+        [first @ 128..=191, marker_and_type, ..] if first & 0x20 == 0 => {
+            Some((marker_and_type & 0x7f).into())
+        }
+        _ => None,
+    }
+}
+
 /// RFC 7983: a first byte of 0 to 3 is STUN.
 fn is_stun(packet: &[u8]) -> bool {
     packet.first().is_some_and(|byte| *byte < 4)
@@ -1785,19 +2113,194 @@ fn readiness(event: &Ready) -> (Token, bool, bool) {
     )
 }
 
-/// Events the API must see. The API drains its queue, so this waits rarely and briefly.
-fn tell(events: &async_mpsc::Sender<Event>, event: Event) {
-    let _ = events.blocking_send(event);
-}
-
-/// Events that may be dropped when the queue is full.
-fn hint(events: &async_mpsc::Sender<Event>, event: Event) {
-    let _ = events.try_send(event);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    /// A room's highest bitrate in 20 ms frames, and the tag, nonce and marker of a seal.
+    const SEALED_FRAME: u32 = 128_000 / 8 / 50 + 16;
+
+    fn defaults() -> Config {
+        let any = Ipv4Addr::LOCALHOST;
+        Config::new(SocketAddr::from((any, 0)), any.into())
+    }
+
+    #[test]
+    fn thirty_seconds_at_the_highest_room_bitrate_all_pass_the_audio_budget() {
+        let start = Instant::now();
+        let mut budget = audio_budget(defaults().audio_kbps, start);
+        for frame in 0..1500 {
+            let at = start + Duration::from_millis(frame * 20);
+            assert!(budget.take(SEALED_FRAME, at), "frame {frame} dropped");
+        }
+    }
+
+    #[test]
+    fn voice_bitrate_overshoot_passes_the_audio_budget_and_a_flood_does_not() {
+        let start = Instant::now();
+        let mut budget = audio_budget(defaults().audio_kbps, start);
+        // Half again over the bitrate through a loud passage of 10 s.
+        for frame in 0..500 {
+            let at = start + Duration::from_millis(frame * 20);
+            assert!(budget.take(SEALED_FRAME * 3 / 2, at), "frame {frame}");
+        }
+        // Then four times the room's top rate, which no client sends.
+        let mut dropped = 0;
+        for frame in 500..2000 {
+            let at = start + Duration::from_millis(frame * 20);
+            dropped += u32::from(!budget.take(SEALED_FRAME * 4, at));
+        }
+        assert!(dropped > 500, "only {dropped} of 1500 dropped");
+    }
+
+    const AT_30_FPS: Duration = Duration::from_millis(33);
+
+    /// A layer of 3,000 bytes a second, broken by a frame over its budget.
+    fn broken_layer(now: Instant) -> Inbound {
+        let mut layer = Inbound::new(24, now);
+        layer.arrived = true;
+        assert!(!layer.admit(false, 4000, now));
+        assert!(layer.broken);
+        layer
+    }
+
+    #[test]
+    fn a_broken_layer_saves_up_for_its_keyframe() {
+        let start = Instant::now();
+        let mut layer = broken_layer(start);
+        // Deltas that would each spend what came in since the last, if they were charged.
+        let mut at = start;
+        for _ in 0..60 {
+            at += AT_30_FPS;
+            assert!(
+                !layer.admit(false, 200, at),
+                "a delta passed a broken layer"
+            );
+        }
+        assert!(layer.admit(true, 2900, at), "the keyframe did not fit");
+        assert!(!layer.broken);
+        assert!(layer.fresh(at));
+    }
+
+    #[test]
+    fn a_keyframe_that_does_not_fit_leaves_the_layer_broken() {
+        let start = Instant::now();
+        let mut layer = broken_layer(start);
+        assert!(!layer.admit(true, 4000, start + AT_30_FPS));
+        assert!(layer.broken);
+        assert!(!layer.fresh(start + AT_30_FPS));
+    }
+
+    #[test]
+    fn keyframe_requests_back_off_while_broken_and_wait_after_a_keyframe() {
+        let start = Instant::now();
+        let mut layer = broken_layer(start);
+        assert!(layer.may_ask(start));
+        layer.asked = Some(start);
+        assert!(!layer.may_ask(start + video::KEYFRAME_EVERY));
+        assert!(layer.may_ask(start + video::KEYFRAME_BROKEN_EVERY));
+
+        let mut healthy = Inbound::new(2400, start);
+        assert!(!healthy.may_ask(start), "no frame has arrived");
+        assert!(healthy.admit(true, 100, start));
+        healthy.arrived = true;
+        assert!(!healthy.may_ask(start), "a keyframe just came");
+        assert!(healthy.may_ask(start + video::KEYFRAME_EVERY));
+    }
+
+    #[test]
+    fn the_payload_type_is_read_from_rtp_only() {
+        let opus: Pt = 111.into();
+        assert_eq!(payload_type(&[0x80, 111, 0, 1]), Some(opus));
+        // The marker bit is not part of it.
+        assert_eq!(payload_type(&[0x80, 0x80 | 111, 0, 1]), Some(opus));
+        // A sender report, DTLS, and STUN.
+        assert_ne!(payload_type(&[0x80, 200, 0, 6]), Some(opus));
+        assert_eq!(payload_type(&[22, 254, 253]), None);
+        assert_eq!(payload_type(&[0, 1, 0, 0]), None);
+        assert_eq!(payload_type(&[0x80]), None);
+        // str0m's probe padding, its padding bit set, on the audio m-line's payload type.
+        assert_eq!(payload_type(&[0xa0, 111, 0, 1]), None);
+        assert_eq!(payload_type(&[0xb0, 0x80 | 111, 0, 1]), None);
+    }
+
+    fn left(call_id: &str) -> Event {
+        Event::Left {
+            call_id: call_id.to_string(),
+            lost: Lost::Gone,
+        }
+    }
+
+    #[test]
+    fn events_over_a_full_queue_wait_their_turn_and_nothing_blocks() {
+        let (sender, mut receiver) = async_mpsc::channel(1);
+        let mut outbox = Outbox::new(sender);
+        // `blocking_send` would stop the media thread here until the API read.
+        for call_id in ["a", "b", "c"] {
+            outbox.tell(left(call_id));
+        }
+        outbox.hint(left("dropped"));
+        assert_eq!(receiver.try_recv().ok(), Some(left("a")));
+        outbox.flush();
+        assert_eq!(receiver.try_recv().ok(), Some(left("b")));
+        outbox.tell(left("d"));
+        assert_eq!(receiver.try_recv().ok(), Some(left("c")));
+        outbox.flush();
+        assert_eq!(receiver.try_recv().ok(), Some(left("d")));
+        assert!(receiver.try_recv().is_err());
+        assert!(outbox.waiting.is_empty());
+    }
+
+    fn slots(call_id: &str, mid: &str) -> Event {
+        Event::Slots {
+            call_id: call_id.to_string(),
+            audio: vec![Slot {
+                mid: mid.to_string(),
+                user_id: "u".to_string(),
+            }],
+            video: None,
+        }
+    }
+
+    #[test]
+    fn slot_maps_over_a_full_queue_keep_only_the_latest_for_each_call() {
+        let (sender, mut receiver) = async_mpsc::channel(1);
+        let mut outbox = Outbox::new(sender);
+        outbox.tell(slots("a", "0"));
+        for at in 1..1000 {
+            outbox.tell(slots("a", &at.to_string()));
+            outbox.tell(slots("b", &at.to_string()));
+        }
+        assert_eq!(outbox.waiting.len(), 2);
+        outbox.tell(left("c"));
+        outbox.tell(left("a"));
+        outbox.tell(slots("b", "last"));
+        let mut heard = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            heard.push(event);
+            outbox.flush();
+        }
+        assert_eq!(
+            heard,
+            vec![
+                slots("a", "0"),
+                slots("a", "999"),
+                slots("b", "last"),
+                left("c"),
+                left("a")
+            ]
+        );
+    }
+
+    #[test]
+    fn events_for_a_gone_api_are_let_go() {
+        let (sender, receiver) = async_mpsc::channel(1);
+        let mut outbox = Outbox::new(sender);
+        drop(receiver);
+        outbox.tell(left("a"));
+        assert!(outbox.waiting.is_empty());
+    }
 
     #[test]
     fn a_missing_audio_packet_is_not_held_for_fifteen_later_ones() {
@@ -1807,5 +2310,112 @@ mod tests {
             config.reordering_timeout_audio(),
             Some(Duration::from_millis(40))
         );
+    }
+}
+
+/// The media thread's steps driven by hand, to see what each one does on its own.
+#[cfg(all(test, feature = "headless"))]
+mod turn_tests {
+    use std::net::{Ipv4Addr, UdpSocket as StdUdpSocket};
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::client::{Client, Running};
+
+    const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
+    const PATIENCE: Duration = Duration::from_secs(3);
+
+    struct Rig {
+        engine: Engine,
+        buf: Vec<u8>,
+        _commands: mpsc::SyncSender<Command>,
+        _events: async_mpsc::Receiver<Event>,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let bind = SocketAddr::from((LOOPBACK, 0));
+            let mut config = Config::new(bind, LOOPBACK.into());
+            config.bwe_start_kbps = None;
+            let (commands, inbox) = mpsc::sync_channel(8);
+            let (events, outbox) = async_mpsc::channel(1024);
+            let alive = Arc::new(AtomicBool::new(true));
+            let (engine, _waker) = Engine::bind(config, inbox, events, alive).expect("bind");
+            Self {
+                engine,
+                buf: vec![0; DATAGRAM],
+                _commands: commands,
+                _events: outbox,
+            }
+        }
+
+        /// Joins a client and runs whole turns until it and everyone else are connected.
+        fn join(&mut self, user_id: &str, marker: u8) -> Running {
+            let mut client = Client::new(SocketAddr::from((LOOPBACK, 0)), 3).expect("client");
+            let offer = client.offer().to_string();
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let now = Instant::now();
+            self.engine
+                .join("r".to_string(), user_id.to_string(), &offer, reply, now);
+            let answer = answer.blocking_recv().expect("reply").expect("answer");
+            client.accept(&answer.sdp).expect("accept");
+            let running = client.start(marker).expect("start");
+            let deadline = Instant::now() + PATIENCE;
+            while !self.engine.peers.values().all(|peer| peer.connected) {
+                assert!(Instant::now() < deadline, "never connected");
+                self.engine.read(&mut self.buf);
+                self.engine.tick(Instant::now());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            running
+        }
+    }
+
+    #[test]
+    fn a_forwarded_frame_leaves_before_the_turn_ends() {
+        let mut rig = Rig::new();
+        let speaker = rig.join("a", b'A');
+        let listener = rig.join("b", b'B');
+        // Packets from a listener would also move its `Rtc` along, so this one sends none.
+        listener.stop();
+        speaker.send_payload(Some(vec![0x55; 1000]));
+        speaker.sending(true);
+        let before = rig.engine.egress;
+        let deadline = Instant::now() + PATIENCE;
+        // Only the socket is read, with no `tick`, which is all that used to send these. RTCP
+        // and STUN for the speaker are far smaller than this many frames.
+        while rig.engine.egress - before < 30_000 {
+            assert!(Instant::now() < deadline, "nothing left for the listener");
+            rig.engine.read(&mut rig.buf);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn the_socket_asks_for_more_buffer_than_the_default() {
+        let rig = Rig::new();
+        let socket = SockRef::from(&rig.engine.socket);
+        // Windows gives what was asked. Linux caps it, at about 200 KiB on a stock kernel.
+        let least = if cfg!(windows) {
+            SOCKET_BUFFER
+        } else {
+            128 * 1024
+        };
+        assert!(socket.recv_buffer_size().expect("read back") >= least);
+        assert!(socket.send_buffer_size().expect("read back") >= least);
+    }
+
+    #[test]
+    fn a_read_stops_at_its_cap_and_says_more_is_waiting() {
+        let mut rig = Rig::new();
+        let sender = StdUdpSocket::bind((LOOPBACK, 0)).expect("bind");
+        for _ in 0..READ_BATCH + 10 {
+            sender
+                .send_to(&[0x80; 32], rig.engine.public)
+                .expect("send");
+        }
+        // Loopback delivers before `send_to` returns, on every platform these tests run on.
+        assert!(rig.engine.read(&mut rig.buf), "more should be waiting");
+        assert!(!rig.engine.read(&mut rig.buf), "the rest was under the cap");
     }
 }

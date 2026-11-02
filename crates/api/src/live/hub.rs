@@ -11,7 +11,7 @@ use sqlx::postgres::PgListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
-use super::call::{Access, Calls, Change, Moderation, Occupancy, Reason, Refused};
+use super::call::{Access, Calls, Change, Moderation, Occupancy, Reason, Refused, Session};
 use super::e2ee;
 use super::frame::{Event, Out, SlotFrame, VideoSlotFrame};
 use super::socket::Close;
@@ -82,10 +82,14 @@ impl People {
         }
     }
 
-    /// Sends `call.e2ee` frames, each to the socket holding its person's seat.
-    fn e2ee(&self, frames: Vec<e2ee::Outgoing>) {
+    /// Sends `call.e2ee` frames, each to the socket holding its person's seat, or keeps them
+    /// for the next one while that seat has none.
+    fn e2ee(&mut self, frames: Vec<e2ee::Outgoing>) {
         for outgoing in frames {
-            self.to_seat(&outgoing.user_id, Arc::from(outgoing.frame));
+            let frame: Arc<str> = Arc::from(outgoing.frame);
+            if !self.calls.hold(&outgoing.user_id, &frame) {
+                self.to_seat(&outgoing.user_id, frame);
+            }
         }
     }
 }
@@ -102,7 +106,11 @@ struct Conn {
     id: u64,
     kick: oneshot::Sender<Close>,
     direct: mpsc::Sender<Arc<str>>,
+    proofs: mpsc::UnboundedSender<Proof>,
 }
+
+/// Answered once a socket has shown it is alive. Dropped if it closes first.
+pub(crate) type Proof = oneshot::Sender<()>;
 
 /// What a socket gets when it joins the hub.
 pub(crate) struct Joined {
@@ -111,6 +119,8 @@ pub(crate) struct Joined {
     pub presence: broadcast::Receiver<Arc<str>>,
     /// Frames for this socket alone.
     pub direct: mpsc::Receiver<Arc<str>>,
+    /// Asks this socket to show it is alive.
+    pub proofs: mpsc::UnboundedReceiver<Proof>,
     pub online: Vec<String>,
     pub calls: Vec<Occupancy>,
 }
@@ -191,6 +201,11 @@ impl Hub {
         }
     }
 
+    /// The SFU stopped with nobody asking it to: a poll failed or its thread panicked.
+    pub fn media_failed(&self) -> bool {
+        !self.closing() && self.media_status() == "down"
+    }
+
     /// Do not establish a socket cursor before the dispatcher has its starting cursor.
     pub async fn ready(&self) {
         let _ = self.ready.subscribe().wait_for(|ready| *ready).await;
@@ -237,6 +252,7 @@ impl Hub {
     pub fn join(&self, user_id: &str, bot: bool) -> Joined {
         let (kick, kicked) = oneshot::channel();
         let (direct, inbox) = mpsc::channel(DIRECT);
+        let (proofs, asked) = mpsc::unbounded_channel();
         let mut people = lock(&self.people);
         people.next_conn += 1;
         let conn = people.next_conn;
@@ -251,6 +267,7 @@ impl Hub {
             id: conn,
             kick,
             direct,
+            proofs,
         });
         if arrived && !bot {
             self.announce(user_id, true);
@@ -269,9 +286,75 @@ impl Hub {
             kicked,
             presence,
             direct: inbox,
+            proofs: asked,
             online,
             calls: people.calls.snapshot(),
         }
+    }
+
+    /// Whether `session` is the device in `user_id`'s seat.
+    pub fn seated(&self, user_id: &str, session: Session) -> bool {
+        lock(&self.people).calls.seated(user_id, session)
+    }
+
+    /// The socket in `user_id`'s seat, if it is open and `session`'s, asked to show it is alive:
+    /// its id, and what answers. The answer's sender is dropped if the socket closes first.
+    pub fn challenge(
+        &self,
+        user_id: &str,
+        session: Session,
+    ) -> Option<(u64, oneshot::Receiver<()>)> {
+        let mut people = lock(&self.people);
+        if !people.calls.seated(user_id, session) {
+            return None;
+        }
+        let from = people.calls.conn_of(user_id)?;
+        let (proof, answered) = oneshot::channel();
+        if let Some(conn) = people
+            .users
+            .get(user_id)
+            .and_then(|person| person.conns.iter().find(|entry| entry.id == from))
+        {
+            let _ = conn.proofs.send(proof);
+        }
+        people.calls.contest(user_id);
+        Some((from, answered))
+    }
+
+    /// Socket `from` answered `challenge`, and keeps the seat.
+    pub fn kept(&self, user_id: &str, from: u64) {
+        lock(&self.people).calls.uncontest(user_id, from);
+    }
+
+    /// Moves `session`'s seat to socket `conn` if no socket holds it, or only `from`, which is
+    /// told it was replaced. The latest `call.slots` and what was held, to send. The seat keeps
+    /// the frames until `delivered`.
+    pub fn regain(
+        &self,
+        user_id: &str,
+        session: Session,
+        conn: u64,
+        from: Option<u64>,
+    ) -> Vec<Arc<str>> {
+        let mut people = lock(&self.people);
+        let Some(regained) = people.calls.regain(user_id, session, conn, from) else {
+            return Vec::new();
+        };
+        tracing::info!(conn, "call seat regained");
+        if let Some(person) = people.users.get_mut(user_id) {
+            if let Some(at) = person.conns.iter().position(|entry| Some(entry.id) == from) {
+                let _ = person.conns.remove(at).kick.send(Close::Replaced);
+            }
+        }
+        let slots = regained
+            .call_id
+            .and_then(|call_id| people.slots.get(&call_id).cloned());
+        slots.into_iter().chain(regained.frames).collect()
+    }
+
+    /// Socket `conn` sent what `regain` gave it.
+    pub fn delivered(&self, user_id: &str, conn: u64) {
+        lock(&self.people).calls.delivered(user_id, conn);
     }
 
     /// Removes a socket. When it was the person's last, they go offline after the grace.
@@ -347,6 +430,7 @@ impl Hub {
         user_limit: i32,
         access: Access,
         e2ee: bool,
+        session: Session,
     ) -> Result<(), Refused> {
         let call_id = answer.map(|answer| answer.call_id.as_str());
         let mut people = lock(&self.people);
@@ -365,6 +449,7 @@ impl Hub {
             access,
             e2ee,
         )?;
+        people.calls.set_session(user_id, session);
         self.tell(&mut people, changes);
         // A seat with media is in the room's group, or is why the room has none. Taking the
         // same seat again with new media is a leave and a join: the old keys went with it.

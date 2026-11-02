@@ -9,7 +9,7 @@ use db::{Caller, CommunityError, SessionError};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::call::{Moves, Reason, Refused};
+use super::call::{Moves, Reason, Refused, Session};
 use super::frame::{Audience, Event, Incoming, Me as MeFrame, Out};
 use super::hub::{access, Hub, Joined, Slot};
 
@@ -62,6 +62,8 @@ type Step = Result<(), End>;
 
 pub(crate) struct Me {
     pub token: String,
+    /// The signed-in device this socket belongs to.
+    pub session: Session,
     pub user_id: String,
     pub role: String,
     /// Server-wide permissions, re-read with the session.
@@ -212,6 +214,7 @@ async fn serve(
         mut kicked,
         mut presence,
         mut direct,
+        mut proofs,
         online,
         calls,
     } = joined;
@@ -266,6 +269,9 @@ async fn serve(
             }
         }
     }
+    if let Err(end) = regain_seat(hub, socket, me, conn).await {
+        return end;
+    }
 
     let mut seen = Instant::now();
     let mut recheck = tokio::time::interval_at(Instant::now() + limits.recheck, limits.recheck);
@@ -279,6 +285,7 @@ async fn serve(
         moves: &mut moves,
         rekeys: &mut rekeys,
     };
+    let mut proving = Vec::new();
 
     loop {
         let step = tokio::select! {
@@ -299,8 +306,18 @@ async fn serve(
                 Err(RecvError::Closed) => Err(End::Close(Close::Restart)),
             },
             Some(frame) = direct.recv() => send_visible(hub, socket, me, frame.as_ref()).await,
+            Some(proof) = proofs.recv() => {
+                proving.push(proof);
+                send_message(hub, socket, Message::Ping(Default::default())).await
+            }
             message = socket.recv() => {
                 seen = Instant::now();
+                // Only this: anything else may have left the client before the link went.
+                if matches!(message, Some(Ok(Message::Pong(_)))) {
+                    for proof in proving.drain(..) {
+                        let _ = proof.send(());
+                    }
+                }
                 receive(hub, socket, me, &mut asking, message).await
             }
             () = tokio::time::sleep_until(seen + limits.idle) => Err(End::Close(Close::Idle)),
@@ -317,6 +334,40 @@ async fn serve(
             return end;
         }
     }
+}
+
+/// Takes the seat this device holds, and sends what it missed. Done here, once the socket has
+/// sent `ready` and the replay, so one that fails first takes nothing from the seat, and before
+/// the socket reads a frame, so a `call.e2ee` from the client finds the seat decided.
+///
+/// A device can have two sockets for good reasons. If the seat's socket has not closed, it may be
+/// half-open, with the client already here, or it may be a call working in another instance. Only
+/// the client can tell, and any client answers a WebSocket ping, so that socket is asked. If it
+/// answers it keeps the seat. If not, or it closes, the seat moves here and it gets `4008`.
+async fn regain_seat(hub: &Hub, socket: &mut WebSocket, me: &mut Me, conn: u64) -> Step {
+    if !hub.seated(&me.user_id, me.session) {
+        return Ok(());
+    }
+    // A sign-out from before this socket's cursor is in no event it will read. One from after is.
+    check(hub, me).await?;
+    let from = match hub.challenge(&me.user_id, me.session) {
+        Some((from, answered)) => {
+            if matches!(
+                tokio::time::timeout(hub.limits.seat_proof, answered).await,
+                Ok(Ok(()))
+            ) {
+                hub.kept(&me.user_id, from);
+                return Ok(());
+            }
+            Some(from)
+        }
+        None => None,
+    };
+    for frame in hub.regain(&me.user_id, me.session, conn, from) {
+        send(hub, socket, frame.to_string()).await?;
+    }
+    hub.delivered(&me.user_id, conn);
+    Ok(())
 }
 
 /// Resolves once the hub is closing, including when it already was.
@@ -658,6 +709,7 @@ async fn call_join(
         found.user_limit,
         access(found.permissions),
         e2ee && answer.is_some(),
+        me.session,
     );
     if let Err(refused) = joined {
         if let Some(answer) = &answer {
@@ -912,7 +964,11 @@ async fn send_visible(hub: &Hub, socket: &mut WebSocket, me: &Me, frame: &str) -
 /// A send that does not finish within the limit drops the socket. Nothing queues behind it
 /// except the bounded broadcast backlog, and a socket that falls past that gets `resync`.
 async fn send(hub: &Hub, socket: &mut WebSocket, text: String) -> Step {
-    match tokio::time::timeout(hub.limits.send_timeout, socket.send(Message::text(text))).await {
+    send_message(hub, socket, Message::text(text)).await
+}
+
+async fn send_message(hub: &Hub, socket: &mut WebSocket, message: Message) -> Step {
+    match tokio::time::timeout(hub.limits.send_timeout, socket.send(message)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(End::Gone),
         Err(_) => {
@@ -997,6 +1053,7 @@ mod tests {
 
     fn bot(scopes: &[&str]) -> super::Me {
         super::Me {
+            session: [0; 32],
             token: String::new(),
             user_id: "b".to_string(),
             role: "bot".to_string(),
@@ -1029,6 +1086,7 @@ mod tests {
         assert!(!unknown.sees_ephemeral(r#"{"type":"future.secret"}"#));
 
         let person = super::Me {
+            session: [0; 32],
             token: String::new(),
             user_id: "u".to_string(),
             role: "member".to_string(),

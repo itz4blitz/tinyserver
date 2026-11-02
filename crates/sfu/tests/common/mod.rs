@@ -26,6 +26,7 @@ pub fn config() -> Config {
     // TWCC estimates depend on how busy the machine is. Layers follow the clients' REMB
     // instead, except in `bwe.rs`.
     config.bwe_start_kbps = None;
+    config.layer_hold = Duration::from_millis(100);
     config
 }
 

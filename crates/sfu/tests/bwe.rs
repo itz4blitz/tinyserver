@@ -51,3 +51,59 @@ async fn the_estimate_climbs_to_h() {
         assert!(Instant::now() < deadline, "the estimate never reached h");
     }
 }
+
+/// With TWCC on, a listener that was paused has no video going out, so only str0m's padding can
+/// lift the estimate far enough to bring it back.
+#[tokio::test]
+async fn a_paused_listener_comes_back_with_twcc_on() {
+    let mut config = config();
+    config.bwe_start_kbps = Some(1000);
+    let mut sfu = start(config);
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    sfu.camera(&a, true).await;
+    sfu.video_for(&b.call_id, Some("a")).await;
+    sees(&b, b'A').await;
+
+    b.running.remb(Some(200));
+    sfu.video_for(&b.call_id, None).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    b.running.take_video();
+    b.running.remb(Some(5000));
+    sfu.video_for(&b.call_id, Some("a")).await;
+    assert!(sees(&b, b'A').await[0].keyframe);
+}
+
+/// A still screen sends next to nothing, so the estimate has nothing to measure and says little.
+/// A real call lost its share this way: the slot went empty and never came back.
+#[tokio::test]
+async fn a_still_screen_keeps_its_share_on_a_low_estimate() {
+    let mut config = config();
+    config.bwe_start_kbps = Some(200);
+    let mut sfu = start(config);
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    assert_eq!(sfu.share_at(&a, true, 20).await, Ok(true));
+    sfu.video_is(&b.call_id, "a", sfu::VideoKind::Share).await;
+    sees(&b, b'A').await;
+    // Thirty holds.
+    let seen = seen_over(&b, Duration::from_secs(3)).await;
+    assert!(seen.len() >= 30, "{} frames", seen.len());
+    assert!(seen.iter().all(|frame| frame.layer == b's'));
+}
+
+/// A listener that has had no video has an idle estimate, far below what a share needs. It gets
+/// the share anyway, and keeps it past the hold if the link carries it.
+#[tokio::test]
+async fn an_idle_estimate_does_not_keep_a_share_away() {
+    let mut config = config();
+    config.bwe_start_kbps = Some(1000);
+    let mut sfu = start(config);
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    // Long enough for the estimate to sink with nothing to measure.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(sfu.share(&a, true).await, Ok(true));
+    sfu.video_is(&b.call_id, "a", sfu::VideoKind::Share).await;
+    assert!(sees(&b, b'A').await[0].keyframe);
+}

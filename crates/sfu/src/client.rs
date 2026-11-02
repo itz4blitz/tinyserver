@@ -34,7 +34,7 @@
 //! The share sends the `h` clip, tagged layer `s` and padded to the share's 2.5 Mb/s.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -224,24 +224,32 @@ impl Client {
             candidate.map_err(|error| io::Error::other(format!("candidate: {error:?}")))?;
         rtc.add_local_candidate(candidate);
 
-        let mut change = rtc.sdp_api();
-        let microphone = change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-        for _ in 0..slots {
-            change.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
-        }
-        let mut layers = Simulcast::new();
-        for layer in &LAYERS {
-            layers.add_send_layer(SimulcastLayer::new(layer.rid));
-        }
-        let camera = change.add_media(
-            MediaKind::Video,
-            Direction::Inactive,
-            None,
-            None,
-            Some(layers),
-        );
-        let share = change.add_media(MediaKind::Video, Direction::Inactive, None, None, None);
-        let screen = change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        // str0m checks a new mid against the session's, not the others in this change. Fifteen
+        // random mids of three characters collide about once in 2,000 offers, and two m-lines
+        // on one mid break the next offer. An unapplied change leaves `rtc` as it was.
+        let (change, microphone, camera, share, screen) = loop {
+            let mut change = rtc.sdp_api();
+            let mut mids = HashSet::new();
+            let mut add = |direction, kind, layers| {
+                let mid = change.add_media(kind, direction, None, None, layers);
+                mids.insert(mid);
+                mid
+            };
+            let microphone = add(Direction::SendOnly, MediaKind::Audio, None);
+            for _ in 0..slots {
+                add(Direction::RecvOnly, MediaKind::Audio, None);
+            }
+            let mut layers = Simulcast::new();
+            for layer in &LAYERS {
+                layers.add_send_layer(SimulcastLayer::new(layer.rid));
+            }
+            let camera = add(Direction::Inactive, MediaKind::Video, Some(layers));
+            let share = add(Direction::Inactive, MediaKind::Video, None);
+            let screen = add(Direction::RecvOnly, MediaKind::Video, None);
+            if mids.len() == slots + 4 {
+                break (change, microphone, camera, share, screen);
+            }
+        };
         let (offer, pending) = change
             .apply()
             .ok_or_else(|| io::Error::other("nothing to offer"))?;
@@ -354,7 +362,12 @@ impl Client {
                         ..Camera::default()
                     };
                 }
-                self.send_video(marker, &mut camera, now);
+                let layers = if shared.single_layer.load(Ordering::Acquire) {
+                    &LAYERS[..1]
+                } else {
+                    &LAYERS[..]
+                };
+                self.send_video(marker, &mut camera, layers, now);
                 next_video += VIDEO_FRAME;
                 continue;
             }
@@ -517,7 +530,7 @@ impl Client {
                         free.insert((token, Conn::new(socket, to)))
                     }
                 };
-                if conn.queue(packet) && conn.flush().is_err() {
+                if conn.queue(packet, false) && conn.flush().is_err() {
                     streams.remove(&to);
                 }
             }
@@ -628,10 +641,10 @@ impl Client {
     }
 
     /// One frame on each layer, with the same RTP time, as a simulcast encoder sends them.
-    fn send_video(&mut self, marker: u8, camera: &mut Camera, now: Instant) {
+    fn send_video(&mut self, marker: u8, camera: &mut Camera, layers: &[Layer], now: Instant) {
         let time = MediaTime::new(camera.sent * TICKS_PER_VIDEO_FRAME, Frequency::NINETY_KHZ);
         camera.sent += 1;
-        for (at, layer) in LAYERS.iter().enumerate() {
+        for (at, layer) in layers.iter().enumerate() {
             let frames = &camera.clips[at];
             if camera.restart[at] {
                 camera.restart[at] = false;
@@ -851,6 +864,8 @@ struct Shared {
     keyframes_asked: AtomicU64,
     share_keyframes_asked: AtomicU64,
     share_kbps: AtomicU64,
+    /// The camera sends `h` alone, as a publisher without simulcast does.
+    single_layer: AtomicBool,
     frames: Mutex<Vec<Frame>>,
     video: Mutex<Vec<VideoFrame>>,
     /// Sent as every audio frame in place of the marker frame, while set.
@@ -869,6 +884,7 @@ impl Default for Shared {
             keyframes_asked: AtomicU64::default(),
             share_keyframes_asked: AtomicU64::default(),
             share_kbps: AtomicU64::new(SHARE_KBPS),
+            single_layer: AtomicBool::default(),
             frames: Mutex::default(),
             video: Mutex::default(),
             sealed: Mutex::default(),
@@ -946,6 +962,11 @@ impl Running {
     /// Pads share frames to `kbps` from the next one on. It starts at 2,500.
     pub fn share_kbps(&self, kbps: u64) {
         self.shared.share_kbps.store(kbps, Ordering::Release);
+    }
+
+    /// Sends `h` alone from the next frame on, as a publisher without simulcast does.
+    pub fn single_layer(&self) {
+        self.shared.single_layer.store(true, Ordering::Release);
     }
 
     /// Undoes the last [`Running::camera`] or [`Running::share`] offer, which the SFU refused,

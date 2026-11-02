@@ -4917,6 +4917,7 @@ version = "0.1.0"
 dependencies = [
  "mio",
  "sfu",
+ "socket2",
  "str0m",
  "tokio",
  "tracing",

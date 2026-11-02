@@ -444,6 +444,43 @@ async fn three_apps_agree_on_a_code_the_server_cannot_know() {
     .await;
 }
 
+/// A commit that came while the seat had no socket is not lost with a socket that closes before
+/// it has sent `ready`. Without it the app could not follow the group.
+#[tokio::test]
+async fn a_commit_kept_for_a_seat_outlives_a_socket_that_fails_at_the_start() {
+    logs();
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, true).await.expect("a");
+        settle(&mut [&mut a], |apps| apps[0].session.is_some()).await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let mut b = dial(ws, &cast.members[0].0, &cast.lobby, true)
+            .await
+            .expect("b");
+        settle(&mut [&mut a, &mut b], agreed(1)).await;
+
+        // The commit that adds c comes while a's seat has no socket.
+        a.ws.close(None).await.expect("close");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ws = socket(&cast, &cast.members[1]).await;
+        let mut c = dial(ws, &cast.members[1].0, &cast.lobby, true)
+            .await
+            .expect("c");
+        settle(&mut [&mut b, &mut c], agreed(2)).await;
+
+        // A cursor past the head: `resync` and a close, with no `ready`.
+        let mut failed = attempt(&cast.server, &cast.owner.1, "?since=999999999")
+            .await
+            .expect("connect");
+        assert_eq!(close_code(&mut failed).await, 4002);
+
+        a.ws = socket(&cast, &cast.owner).await;
+        settle(&mut [&mut a, &mut b, &mut c], agreed(2)).await;
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn only_the_seat_holder_speaks_mls_and_only_as_itself() {
     logs();
@@ -453,8 +490,12 @@ async fn only_the_seat_holder_speaks_mls_and_only_as_itself() {
         let mut a = dial(ws, &cast.owner.0, &cast.lobby, true).await.expect("a");
         settle(&mut [&mut a], |apps| apps[0].starts == 1).await;
 
-        // Another socket of the same person does not hold the seat; nor does anyone outside.
-        let mut other = socket(&cast, &cast.owner).await;
+        // Their other device does not hold the seat; nor does anyone outside.
+        let other_device = db::open_session(&db.runtime, &cast.owner.0)
+            .await
+            .expect("a second session")
+            .token;
+        let mut other = connect(&cast.server, &other_device, None).await.0;
         let kp = json!({"type": "call.e2ee", "ref": "k", "op": "key_package", "data": "AAAA"});
         let reply = answer(&mut other, kp.clone()).await;
         assert_eq!(

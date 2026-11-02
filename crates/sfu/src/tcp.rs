@@ -9,9 +9,10 @@ use mio::net::TcpStream;
 /// The largest frame either side sends or takes. Larger than any packet str0m makes, and
 /// the same as one UDP read.
 pub(crate) const FRAME_MAX: usize = 2000;
-/// Bytes waiting to go out on one stream. A packet that would pass it is dropped, as UDP
-/// would lose it.
-const BACKLOG: usize = 256 * 1024;
+/// Bytes waiting to go out on one stream, audio and everything else each. A packet that would
+/// pass it is dropped, as UDP would lose it: past about 100 ms at a call's rates, a packet that
+/// waits arrives too late to play.
+const BACKLOG: usize = 32 * 1024;
 /// One read from a stream.
 const CHUNK: usize = 4096;
 
@@ -82,12 +83,56 @@ pub(crate) enum Readout {
     Closed,
 }
 
+/// What waits to go out on a stream. Audio passes everything else, but only between frames:
+/// a frame started on the wire must finish, or the stream's framing is lost.
+#[derive(Debug, Default)]
+struct Backlog {
+    urgent: Vec<u8>,
+    bulk: Vec<u8>,
+    /// Whole frames on their way, of which the first `written` bytes have gone.
+    writing: Vec<u8>,
+    written: usize,
+}
+
+impl Backlog {
+    /// Queues one packet as a frame. False if it was dropped.
+    fn push(&mut self, packet: &[u8], urgent: bool) -> bool {
+        let queue = if urgent {
+            &mut self.urgent
+        } else {
+            &mut self.bulk
+        };
+        encode(packet, queue)
+    }
+
+    /// The bytes to write next, starting the next frames once the last have gone. Empty once
+    /// nothing is waiting.
+    fn next(&mut self) -> &[u8] {
+        if self.written == self.writing.len() {
+            self.writing.clear();
+            self.written = 0;
+            if !self.urgent.is_empty() {
+                std::mem::swap(&mut self.writing, &mut self.urgent);
+            } else if let [high, low, ..] = self.bulk[..] {
+                let frame = 2 + usize::from(u16::from_be_bytes([high, low]));
+                self.writing.extend(self.bulk.drain(..frame));
+            }
+        }
+        self.writing.get(self.written..).unwrap_or_default()
+    }
+
+    /// `n` bytes of `next` went out.
+    fn wrote(&mut self, n: usize) {
+        self.written += n;
+    }
+}
+
 /// One TCP stream: framed reads and a bounded write backlog.
 pub(crate) struct Conn {
     pub socket: TcpStream,
     pub peer: SocketAddr,
     framer: Framer,
-    out: Vec<u8>,
+    backlog: Backlog,
 }
 
 impl Conn {
@@ -96,7 +141,7 @@ impl Conn {
             socket,
             peer,
             framer: Framer::new(FRAME_MAX),
-            out: Vec::new(),
+            backlog: Backlog::default(),
         }
     }
 
@@ -135,19 +180,21 @@ impl Conn {
         }
     }
 
-    /// Queues one packet. False if it was dropped.
-    pub fn queue(&mut self, packet: &[u8]) -> bool {
-        encode(packet, &mut self.out)
+    /// Queues one packet, ahead of the others if `urgent`. False if it was dropped.
+    pub fn queue(&mut self, packet: &[u8], urgent: bool) -> bool {
+        self.backlog.push(packet, urgent)
     }
 
     /// Writes what it can. `Ok(true)` once nothing is waiting.
     pub fn flush(&mut self) -> io::Result<bool> {
-        while !self.out.is_empty() {
-            match self.socket.write(&self.out) {
+        loop {
+            let bytes = self.backlog.next();
+            if bytes.is_empty() {
+                return Ok(true);
+            }
+            match self.socket.write(bytes) {
                 Ok(0) => return Err(ErrorKind::WriteZero.into()),
-                Ok(n) => {
-                    self.out.drain(..n);
-                }
+                Ok(n) => self.backlog.wrote(n),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 // Not connected yet: a client's connect is still in flight.
@@ -155,13 +202,68 @@ impl Conn {
                 Err(error) => return Err(error),
             }
         }
-        Ok(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{encode, BadFrame, Framer, FRAME_MAX};
+    use super::{encode, Backlog, BadFrame, Framer, BACKLOG, FRAME_MAX};
+
+    /// Takes everything from `backlog` in `step`-byte writes, and returns the frames in order.
+    fn sent(backlog: &mut Backlog, step: usize) -> Vec<Vec<u8>> {
+        let mut framer = Framer::new(FRAME_MAX);
+        let mut frames = Vec::new();
+        loop {
+            let bytes = backlog.next();
+            let n = bytes.len().min(step);
+            if n == 0 {
+                return frames;
+            }
+            framer.push(&bytes[..n]);
+            backlog.wrote(n);
+            while let Ok(Some(frame)) = framer.next_frame() {
+                frames.push(frame);
+            }
+        }
+    }
+
+    /// As `sent`, with the first `skip` bytes, the rest of a frame already started, left out.
+    fn sent_after(backlog: &mut Backlog, skip: usize) -> Vec<Vec<u8>> {
+        let bytes = backlog.next();
+        assert_eq!(bytes.len(), skip, "the frame started goes first");
+        backlog.wrote(skip);
+        sent(backlog, 3)
+    }
+
+    #[test]
+    fn audio_goes_ahead_of_what_waits_but_not_into_a_frame() {
+        let mut backlog = Backlog::default();
+        assert!(backlog.push(b"video one", false));
+        assert!(backlog.push(b"video two", false));
+        // The first frame has started: two bytes of it are on the wire.
+        let started = backlog.next();
+        assert_eq!(started.len(), 11);
+        backlog.wrote(2);
+        assert!(backlog.push(b"audio", true));
+        let mut out = sent_after(&mut backlog, 9);
+        // The rest of the first frame, whose head went out above, cannot be read as a frame
+        // here; what follows is whole, with audio first.
+        assert_eq!(out.pop(), Some(b"video two".to_vec()));
+        assert_eq!(out.pop(), Some(b"audio".to_vec()));
+    }
+
+    #[test]
+    fn each_queue_is_bounded_alone() {
+        let mut backlog = Backlog::default();
+        let packet = [7; 1000];
+        let fits = BACKLOG / (packet.len() + 2);
+        for _ in 0..fits {
+            assert!(backlog.push(&packet, false));
+        }
+        assert!(!backlog.push(&packet, false), "video past the cap");
+        assert!(backlog.push(&packet, true), "video cannot crowd out audio");
+        assert_eq!(sent(&mut backlog, 700).len(), fits + 1);
+    }
 
     #[test]
     fn frames_split_across_reads_come_out_whole() {
